@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>OpenCode Gateway Next</title>
+  <link rel="stylesheet" href="/static/style.css?v=1.0.0">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true">OG</div>
+        <div><strong>OpenCode</strong><span>Gateway Next</span></div>
+      </div>
+      <div class="sidebar-caption">控制面板</div>
+      <nav class="side-nav" aria-label="页面导航">
+        <a href="#fleetPanel" class="active"><span class="nav-icon">▦</span>实例与出口</a>
+        <a href="#mihomoPanel"><span class="nav-icon">⌁</span>Mihomo 转换</a>
+        <a href="#keysPanel"><span class="nav-icon">⌘</span>访问密钥</a>
+        <a href="#logsPanel"><span class="nav-icon">≡</span>审计与日志</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="connection-state"><span class="status-dot"></span><span>控制面在线</span></div>
+        <div id="versionStatus" class="version-status">v1.0.0 · 检查更新中</div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div><p class="eyebrow">CONTROL PLANE / OPERATIONS</p><h1>OpenCode Gateway Next</h1><p class="subtitle">统一管理网关实例、出口健康和请求审计。</p></div>
+        <div class="top-actions"><button id="themeToggle" class="theme-toggle" type="button" title="切换主题"><span class="theme-icon">☾</span><span class="theme-label">深色模式</span></button><button id="refresh" class="button button-quiet" type="button" title="刷新数据">刷新</button></div>
+      </header>
+
+      <section class="metrics" aria-label="运行指标">
+        <div class="metric-card"><span class="metric-label">实例总数</span><strong id="instances">-</strong><small>受控网关容器</small></div>
+        <div class="metric-card"><span class="metric-label">总并发上限</span><strong id="concurrency">-</strong><small>当前实例容量</small></div>
+        <div class="metric-card"><span class="metric-label">健康实例</span><strong id="online">-</strong><small>可接收请求</small></div>
+        <div class="metric-card metric-alert"><span class="metric-label">上游 429</span><strong id="rate">-</strong><small>累计请求统计</small></div>
+      </section>
+
+      <section id="fleetPanel" class="panel panel-primary"><div class="section-heading"><div><span class="section-index">01</span><div><h2>实例与出口</h2><p>按需创建网关实例，实例会固定当前出口，仅在异常或 429 时换线。</p></div></div><div class="actions"><button id="probe" class="button button-quiet" type="button">刷新探测</button><button id="openCreate" class="button button-primary" type="button">新建实例</button></div></div><div class="table-wrap"><table><thead><tr><th>实例</th><th>运行状态</th><th>Zen API Key</th><th>并发</th><th>当前出口</th><th>操作</th></tr></thead><tbody id="fleet"></tbody></table></div></section>
+
+      <section id="mihomoPanel" class="panel"><div class="section-heading"><div><span class="section-index">02</span><div><h2>Mihomo 协议转换</h2><p>导入 Clash/Mihomo 订阅，将 VLESS、Trojan、Shadowsocks 等节点转换为本地 SOCKS5 出口。</p></div></div><div class="head-actions"><button type="button" id="mihomoProbe" class="button button-quiet">检测健康</button><span id="mihomoStatus" class="badge wait">检测中</span></div></div><form id="mihomoForm" class="inline-form"><label>订阅地址<input name="subscription_url" type="url" autocomplete="off" placeholder="留空保持现有订阅，输入新地址则替换"><small>仅接受服务商提供的 Clash/Mihomo 格式订阅。</small></label><div class="actions"><button type="submit" class="button button-primary">保存并生成出口</button><button type="button" id="mihomoCopy" class="button button-quiet">复制全部地址</button><button type="button" id="mihomoClear" class="button button-danger">清除订阅</button></div></form><div id="mihomoProxy" class="proxy-list">尚未生成代理入口</div><div class="pager"><button type="button" id="mihomoPrev" class="icon-button" title="上一页">‹</button><span id="mihomoPage">0 / 0</span><button type="button" id="mihomoNext" class="icon-button" title="下一页">›</button></div></section>
+
+      <section id="keysPanel" class="panel"><div class="section-heading"><div><span class="section-index">03</span><div><h2>网关访问密钥</h2><p>客户端调用统一入口时使用，新增或删除后会同步到全部实例。</p></div></div><button id="newKey" class="button button-primary" type="button">生成密钥</button></div><div id="keys" class="key-grid"></div></section>
+
+      <section id="logsPanel" class="panel"><div class="section-heading log-heading"><div><span class="section-index">04</span><div><h2>审计与日志</h2><p>按控制面、Mihomo 和实例分类查看运行事件与请求记录。</p></div></div><div id="logTabs" class="log-tabs"></div></div><div id="logs" class="log-list"></div></section>
+      <footer class="page-footer"><span>OpenCode Gateway Next · <span id="updated">-</span></span><span>管理接口由 ADMIN_TOKEN 保护</span></footer>
+    </main>
+  </div>
+
+  <dialog id="createDialog"><form method="dialog" id="createForm"><div class="dialog-heading"><div><span class="section-index">NEW</span><div><h2>新建网关实例</h2><p>实例会使用固定网关镜像和受限参数创建。</p></div></div><button class="icon-button" value="cancel" formnovalidate title="关闭">×</button></div><label>实例名称<input name="name" pattern="(?:gateway-)?[A-Za-z0-9][A-Za-z0-9 _-]{0,38}" placeholder="留空自动生成，例如 gateway-b"></label><label>上游鉴权方式<select name="auth_mode"><option value="public" selected>公共 Key（Bearer public）</option><option value="custom">自定义 Zen API Key</option></select></label><label data-custom-key>Zen API Key<input name="zen_api_key" type="password" maxlength="512" autocomplete="new-password" placeholder="在 opencode.ai/auth 申请的 API Key"></label><div class="form-grid"><label>并发上限<input name="max_concurrency" type="number" min="1" max="64" value="4"></label><label>队列容量<input name="queue_size" type="number" min="0" max="256" value="8"></label></div><label>HTTP / HTTPS / SOCKS5 候选出口<textarea name="proxy_urls" rows="4" placeholder="每行一个，例如 socks5h://mihomo:10801"></textarea></label><div class="mihomo-choice-panel"><div class="choice-head"><span>Mihomo 转换出口</span><button type="button" class="text-button use-mihomo" data-form="createForm">使用全部健康出口</button></div><div id="createMihomoChoices" class="mihomo-choice-grid"><span class="muted">尚未生成 Mihomo 出口</span></div></div><p class="form-note">实例固定使用一个当前出口，仅在 429、故障、IP 冲突或手动操作时切换。</p><div class="dialog-actions"><button value="cancel" formnovalidate class="button button-quiet">取消</button><button id="createSubmit" value="default" class="button button-primary">创建并启动</button></div></form></dialog>
+
+  <dialog id="settingsDialog"><form method="dialog" id="settingsForm"><div class="dialog-heading"><div><span class="section-index">EDIT</span><div><h2>实例设置</h2><p id="settingsHint">保存后会重建实例容器。</p></div></div><button class="icon-button" value="cancel" formnovalidate title="关闭">×</button></div><input type="hidden" name="name"><label>上游鉴权方式<select name="auth_mode"><option value="public">公共 Key（Bearer public）</option><option value="custom">自定义 Zen API Key</option></select></label><label data-custom-key>新 Zen API Key<input name="zen_api_key" type="password" maxlength="512" autocomplete="new-password" placeholder="自定义模式下填写，留空保持当前 Key"></label><label>HTTP / HTTPS / SOCKS5 候选出口<textarea name="proxy_urls" rows="6" placeholder="每行一个，例如 socks5h://mihomo:10801"></textarea></label><div class="mihomo-choice-panel"><div class="choice-head"><span>Mihomo 转换出口</span><button type="button" class="text-button use-mihomo" data-form="settingsForm">使用全部健康出口</button></div><div id="settingsMihomoChoices" class="mihomo-choice-grid"><span class="muted">尚未生成 Mihomo 出口</span></div></div><p class="form-note">VLESS、Trojan、Shadowsocks 等节点先由 Mihomo 转换；红点出口不会参与请求。</p><div class="form-grid"><label>并发上限<input name="max_concurrency" type="number" min="1" max="64"></label><label>队列容量<input name="queue_size" type="number" min="0" max="256"></label></div><div class="dialog-actions"><button value="cancel" formnovalidate class="button button-quiet">取消</button><button value="default" class="button button-primary">保存并应用</button></div></form></dialog>
+  <script src="/static/app.js?v=1.0.0"></script>
+</body>
+</html>

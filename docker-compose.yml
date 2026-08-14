@@ -1,0 +1,49 @@
+services:
+  control-plane:
+    image: opencode-gateway-next-gateway:latest
+    build:
+      context: .
+      dockerfile: ${GATEWAY_DOCKERFILE:-Dockerfile}
+    entrypoint: ["/control-plane"]
+    user: "0:0"
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CONTROL_LISTEN_ADDR: 0.0.0.0:13338
+      API_LISTEN_ADDR: 0.0.0.0:13337
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      INSTANCE_ADMIN_TOKEN: ${INSTANCE_ADMIN_TOKEN:-${ADMIN_TOKEN}}
+      GATEWAY_KEYS: ${GATEWAY_KEYS}
+      CONTROL_DATA_DIR: /control-data
+      GATEWAY_IMAGE: ${GATEWAY_IMAGE:-opencode-gateway-next-gateway:latest}
+      GATEWAY_NETWORK: ${GATEWAY_NETWORK:-opencode-gateway-network}
+      DIRECT_FALLBACK: ${DIRECT_FALLBACK:-${NGINX_DIRECT_FALLBACK:-false}}
+      MIHOMO_CONTAINER: opencode-gateway-mihomo
+      MIHOMO_CONFIG_DIR: /mihomo-config
+      MIHOMO_API_URL: http://mihomo:9090
+      MIHOMO_MAX_SLOTS: ${MIHOMO_MAX_SLOTS:-64}
+      MAX_INSTANCES: ${MAX_INSTANCES:-16}
+    ports:
+      - "127.0.0.1:${CONTROL_HOST_PORT:-13338}:13338"
+      - "127.0.0.1:${API_HOST_PORT:-${NGINX_HOST_PORT:-13337}}:13337"
+    volumes:
+      - "./data/control:/control-data"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./mihomo:/mihomo-config"
+    depends_on: [mihomo]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+  mihomo:
+    image: metacubex/mihomo:v1.19.29
+    container_name: opencode-gateway-mihomo
+    restart: unless-stopped
+    command: ["-d", "/etc/mihomo", "-f", "/etc/mihomo/config.yaml"]
+    volumes:
+      - "./mihomo:/etc/mihomo"
+    security_opt: [no-new-privileges:true]
+
+networks:
+  default:
+    name: opencode-gateway-network
