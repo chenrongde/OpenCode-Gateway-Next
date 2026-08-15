@@ -144,6 +144,12 @@ func TestForwardRetriesOnlyDistinctEgressAndSetsOpenCodeHeaders(t *testing.T) {
 		if got := r.Header.Get("X-OpenCode-Client"); got != opencodeClient {
 			t.Errorf("x-opencode-client = %q", got)
 		}
+		if got := r.Header.Get("HTTP-Referer"); got != opencodeReferer {
+			t.Errorf("http-referer = %q", got)
+		}
+		if got := r.Header.Get("X-Title"); got != opencodeTitle {
+			t.Errorf("x-title = %q", got)
+		}
 		requestIDsMu.Lock()
 		requestIDs[r.Header.Get("X-OpenCode-Request")] = struct{}{}
 		requestIDsMu.Unlock()
@@ -187,6 +193,12 @@ func TestForwardOverridesClientOpenCodeHeaders(t *testing.T) {
 		if got := r.Header.Get("X-OpenCode-Client"); got != opencodeClient {
 			t.Errorf("x-opencode-client = %q", got)
 		}
+		if got := r.Header.Get("HTTP-Referer"); got != opencodeReferer {
+			t.Errorf("http-referer = %q", got)
+		}
+		if got := r.Header.Get("X-Title"); got != opencodeTitle {
+			t.Errorf("x-title = %q", got)
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
@@ -204,6 +216,148 @@ func TestForwardOverridesClientOpenCodeHeaders(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}
 }
+
+func TestForwardUsesConfiguredZenCPAHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "opencode/1.4.3" {
+			t.Errorf("user-agent = %q", got)
+		}
+		if got := r.Header.Get("HTTP-Referer"); got != "https://opencode.ai/" {
+			t.Errorf("http-referer = %q", got)
+		}
+		if got := r.Header.Get("X-Title"); got != "opencode" {
+			t.Errorf("x-title = %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	c := testConfig(upstream.URL)
+	c.OpenCodeVersion = "1.4.3"
+	c.OpenCodeReferer = "https://opencode.ai/"
+	c.OpenCodeTitle = "opencode"
+	g, err := New(c, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestForwardAddsContextToUpstreamResponseEOF(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(&errorReader{err: io.ErrUnexpectedEOF}),
+		}, nil
+	})}
+	g, err := New(testConfig("https://example.com"), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	failing := &proxySlot{client: client, egress: "192.0.2.1"}
+	healthy := &proxySlot{client: g.client, url: "socks5h://proxy:10802", egress: "192.0.2.2"}
+	g.slots = []*proxySlot{failing, healthy}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if g.stats.Success.Load() != 0 || g.stats.Errors.Load() != 1 {
+		t.Fatalf("stats success=%d errors=%d", g.stats.Success.Load(), g.stats.Errors.Load())
+	}
+	if failing.fails == 0 || g.active.Load() != 1 {
+		t.Fatalf("failing slot=%#v active=%d", failing, g.active.Load())
+	}
+	g.logsMu.RLock()
+	logs := append([]systemLog(nil), g.logs...)
+	g.logsMu.RUnlock()
+	if len(logs) == 0 || !strings.Contains(logs[len(logs)-1].Message, "forward failed") || !strings.Contains(logs[len(logs)-1].Fields["error"].(string), "upstream response body") {
+		t.Fatalf("logs = %#v", logs)
+	}
+}
+
+func TestForwardRetriesNonStreamingTruncatedResponseOnNextEgress(t *testing.T) {
+	firstClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(&errorReader{err: io.ErrUnexpectedEOF})}, nil
+	})}
+	secondClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+	})}
+	c := testConfig("https://example.com")
+	c.MaxRetries = 1
+	g, err := New(c, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.slots = []*proxySlot{
+		{client: firstClient, url: "socks5h://proxy:10801", egress: "192.0.2.1"},
+		{client: secondClient, url: "socks5h://proxy:10802", egress: "192.0.2.2"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":false}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || res.Body.String() != `{"ok":true}` {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if g.active.Load() != 1 || g.stats.Success.Load() != 1 || g.stats.Errors.Load() != 0 {
+		t.Fatalf("active=%d success=%d errors=%d", g.active.Load(), g.stats.Success.Load(), g.stats.Errors.Load())
+	}
+	g.auditMu.RLock()
+	audits := append([]auditRecord(nil), g.audits...)
+	g.auditMu.RUnlock()
+	if len(audits) != 2 || audits[0].Status != http.StatusBadGateway || audits[1].Status != http.StatusOK || audits[1].Attempts != 2 {
+		t.Fatalf("audits=%#v", audits)
+	}
+}
+
+func TestForwardRetriesStreamingResponseBeforeFirstOutput(t *testing.T) {
+	firstCalls, secondCalls := 0, 0
+	firstClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		firstCalls++
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(&errorReader{err: io.ErrUnexpectedEOF})}, nil
+	})}
+	secondClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		secondCalls++
+		body := "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	c := testConfig("https://example.com")
+	c.MaxRetries = 1
+	g, err := New(c, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.slots = []*proxySlot{
+		{client: firstClient, url: "socks5h://proxy:10801", egress: "192.0.2.1"},
+		{client: secondClient, url: "socks5h://proxy:10802", egress: "192.0.2.2"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":true}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"content":"OK"`) || firstCalls != 1 || secondCalls != 1 {
+		t.Fatalf("status=%d first=%d second=%d body=%s", res.Code, firstCalls, secondCalls, res.Body.String())
+	}
+	g.auditMu.RLock()
+	audits := append([]auditRecord(nil), g.audits...)
+	g.auditMu.RUnlock()
+	if len(audits) != 2 || audits[0].Status != http.StatusBadGateway || audits[1].Status != http.StatusOK || audits[1].Attempts != 2 {
+		t.Fatalf("audits = %#v", audits)
+	}
+}
+
+type errorReader struct{ err error }
+
+func (r *errorReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestModelCooldownDoesNotBlockOtherModelsOnSameEgress(t *testing.T) {
 	var calls atomic.Int32
@@ -636,5 +790,73 @@ func TestDialSOCKS5PassesHostnameToProxy(t *testing.T) {
 	_ = conn.Close()
 	if target := <-targets; target != "opencode.ai:443" {
 		t.Fatalf("target = %q", target)
+	}
+}
+
+func TestTokenUsageParsesRegularAndStreamingResponses(t *testing.T) {
+	regular := parseTokenUsage([]byte(`{"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"prompt_tokens_details":{"cached_tokens":4}}}`))
+	if regular != (tokenUsage{PromptTokens: 12, CompletionTokens: 8, TotalTokens: 20, CachedTokens: 4}) {
+		t.Fatalf("regular usage = %#v", regular)
+	}
+
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":9,\"total_tokens\":24}}\n\ndata: [DONE]\n\n")
+	usage, firstTokenMS, committed, err := copyResponse(response, stream, time.Now().Add(-20*time.Millisecond), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage != (tokenUsage{PromptTokens: 15, CompletionTokens: 9, TotalTokens: 24}) {
+		t.Fatalf("stream usage = %#v", usage)
+	}
+	if firstTokenMS < 10 {
+		t.Fatalf("first token latency = %dms", firstTokenMS)
+	}
+	if !committed {
+		t.Fatal("stream response was not committed after its first output token")
+	}
+	if !strings.Contains(response.Body.String(), "data: [DONE]") {
+		t.Fatalf("stream was not forwarded: %q", response.Body.String())
+	}
+}
+
+func TestCopyResponseAddsFinishReasonBeforeDoneWhenUpstreamOmitsIt(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n")
+
+	_, _, committed, err := copyResponse(response, stream, time.Now(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed {
+		t.Fatal("stream response was not committed")
+	}
+	body := response.Body.String()
+	finishAt := strings.Index(body, `"finish_reason":"stop"`)
+	doneAt := strings.Index(body, "data: [DONE]")
+	if finishAt < 0 || doneAt < 0 || finishAt > doneAt {
+		t.Fatalf("terminal finish chunk must precede [DONE], body = %q", body)
+	}
+}
+
+func TestCopyResponseDoesNotDuplicateUpstreamFinishReason(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+
+	_, _, committed, err := copyResponse(response, stream, time.Now(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed {
+		t.Fatal("stream response was not committed")
+	}
+	if count := strings.Count(response.Body.String(), `"finish_reason":"stop"`); count != 1 {
+		t.Fatalf("finish reason count = %d, body = %q", count, response.Body.String())
+	}
+}
+
+func TestMaskGatewayKeyDoesNotExposePlaintext(t *testing.T) {
+	masked := maskGatewayKey("gw_1234567890abcdef")
+	if masked != "gw_...cdef" || strings.Contains(masked, "1234567890") {
+		t.Fatalf("masked key = %q", masked)
 	}
 }

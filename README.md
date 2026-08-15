@@ -2,7 +2,7 @@
 
 OpenCode Gateway Next 是一个可自托管的 OpenCode API 网关。它将多个动态网关实例、Zen API Key、代理出口、Mihomo 节点和请求审计集中到一个控制台管理，并向客户端提供统一的 OpenAI 兼容 API。
 
-当前版本：**1.0.0**
+当前版本：**1.0.4**
 
 > 本项目面向技术研究和个人自托管场景。上游模型、额度、速率限制和账户规则以 OpenCode 官方说明为准。增加实例或出口不等于增加上游账户额度。
 
@@ -16,6 +16,9 @@ OpenCode Gateway Next 是一个可自托管的 OpenCode API 网关。它将多�
 - 启动后异步检测代理健康状态和真实公网出口 IP。
 - 普通请求固定使用当前出口；只有发生 429、连接故障、出口重复或手动换线时才切换。
 - 按控制面、Mihomo 和各网关实例分类展示系统日志与请求审计。
+- 提供独立的 API Token 统计页，按脱敏调用密钥、模型、实例、状态和流式模式汇总输入、输出与缓存 Token，并显示首字耗时、流式 Token 速度和 USD 费用明细。
+- 新启动或重启的实例会先通过 `/healthz` 预检，再加入 API 流量池，避免首次请求被尚未就绪的容器接收。
+- 控制台按 `/instances`、`/mihomo`、`/keys`、`/logs` 和 `/tokens` 分离工作区，便于日常运维。
 - 提供浅色、深色主题，并在控制台检查 GitHub 最新版本。
 
 ![OpenCode Gateway Next 控制台](./image/1.png)
@@ -126,6 +129,9 @@ API_HOST_PORT=13337
 | `MIHOMO_MAX_SLOTS` | `64` | Mihomo 最大出口槽位数，硬上限 128 |
 | `DIRECT_FALLBACK` | `false` | 代理实例存在时是否仍允许直连实例参与分流 |
 | `GATEWAY_IMAGE` | 项目镜像 | 动态实例使用的固定镜像 |
+| `OPENCODE_VERSION` | `1.18.16` | 上游 `User-Agent` 中的版本号 |
+| `OPENCODE_REFERER` | `https://opencode.ai/` | 上游 `HTTP-Referer` |
+| `OPENCODE_TITLE` | `opencode` | 上游 `X-Title` |
 
 完整示例请查看 [config.example.env](./config.example.env)。
 
@@ -168,6 +174,8 @@ Mihomo 面板每页显示 10 个端口。不可用节点以红色标记，不会
 
 429 冷却按“实例 + 模型 + 出口”记录。某个模型在一个出口进入冷却，不会自动切换模型，也不会无限重试。网关只在健康候选中执行有限次数的重试。
 
+控制面还会对实例级故障执行短时熔断：实例返回 `5xx`、转发连接错误或响应体截断后，统一 API 会在 15 秒内跳过该实例；连续失败按指数延长，最长 2 分钟。完整响应传输结束后自动恢复。这样多实例同时运行时，单个出口抖动不会持续影响其他健康实例。
+
 控制台中的计数含义：
 
 | 指标 | 含义 |
@@ -204,6 +212,17 @@ curl --no-buffer http://127.0.0.1:13337/v1/chat/completions \
     "stream": true
   }'
 ```
+
+网关向 OpenCode Zen 转发时会覆盖客户端传入的上游鉴权和客户端标识，并发送 Zen CPA 所需的请求头：
+
+```text
+User-Agent: opencode/1.18.16
+HTTP-Referer: https://opencode.ai/
+X-Title: opencode
+X-OpenCode-Client: cli
+```
+
+其中前三项可以通过 `OPENCODE_VERSION`、`OPENCODE_REFERER` 和 `OPENCODE_TITLE` 调整。客户端的 `Authorization` 只用于访问网关，实例自己的 Zen API Key 才用于访问上游。
 
 ## 单域名反代
 
@@ -292,6 +311,7 @@ docker logs --tail=100 gateway-a
 | 出口显示直连 | 实例是否保存了代理地址、Mihomo 端口是否健康 |
 | 模型返回 429 | 审计中的 `upstream429`、当前模型冷却和 Zen Key 状态 |
 | 返回 `gateway_overloaded` | 实例并发上限、队列容量和当前请求数 |
+| `upstream response read: unexpected EOF` | 当前出口的上游连接提前关闭；查看该实例的出口 IP 与 Mihomo 节点，后续请求会切到下一个健康出口；非流式请求会在候选出口上有限重试 |
 | 控制台样式未更新 | 静态资源版本参数、CDN 缓存和控制面容器是否重建 |
 | Mihomo 节点 TLS 错误 | 节点 SNI、证书域名、订阅有效性和节点服务状态 |
 

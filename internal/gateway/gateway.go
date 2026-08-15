@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -41,9 +42,16 @@ type cooldownState struct {
 	Until time.Time
 }
 
-var errNoUntriedSlot = errors.New("no untried upstream slot")
+var (
+	errNoUntriedSlot        = errors.New("no untried upstream slot")
+	errUpstreamResponseRead = errors.New("upstream response read")
+	errUpstreamStreamEmpty  = errors.New("upstream stream ended before first output")
+)
 
-const maxModelCooldownsPerSlot = 256
+const (
+	maxModelCooldownsPerSlot = 256
+	maxBufferedResponseBytes = 32 << 20
+)
 
 func (s *proxySlot) identity() string {
 	s.mu.Lock()
@@ -166,18 +174,39 @@ type Gateway struct {
 }
 
 type auditRecord struct {
-	At         time.Time `json:"at"`
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	Model      string    `json:"model,omitempty"`
-	Status     int       `json:"status"`
-	Slot       string    `json:"slot"`
-	Egress     string    `json:"egress,omitempty"`
-	LatencyMS  int64     `json:"latency_ms"`
-	Source     string    `json:"source"`
-	Attempts   int       `json:"attempts"`
-	RetryAfter string    `json:"retry_after,omitempty"`
+	At               time.Time `json:"at"`
+	Method           string    `json:"method"`
+	Path             string    `json:"path"`
+	Model            string    `json:"model,omitempty"`
+	Status           int       `json:"status"`
+	Slot             string    `json:"slot"`
+	Egress           string    `json:"egress,omitempty"`
+	LatencyMS        int64     `json:"latency_ms"`
+	Source           string    `json:"source"`
+	Attempts         int       `json:"attempts"`
+	RetryAfter       string    `json:"retry_after,omitempty"`
+	ClientKey        string    `json:"client_key,omitempty"`
+	Stream           bool      `json:"stream"`
+	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64     `json:"completion_tokens,omitempty"`
+	TotalTokens      int64     `json:"total_tokens,omitempty"`
+	CachedTokens     int64     `json:"cached_tokens,omitempty"`
+	FirstTokenMS     int64     `json:"first_token_ms,omitempty"`
 }
+
+type tokenUsage struct {
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+	CachedTokens     int64
+}
+
+type auditMetadata struct {
+	ClientKey string
+	Stream    bool
+}
+
+type auditMetadataKey struct{}
 
 type systemLog struct {
 	At      time.Time      `json:"at"`
@@ -1005,6 +1034,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
+	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, auditMetadata{ClientKey: maskGatewayKey(requestBearer(r))}))
 	if allowed, allow := methodAllowed(r.URL.Path, r.Method); !allowed {
 		w.Header().Set("Allow", allow)
 		w.Header().Set("Content-Type", "application/json")
@@ -1067,7 +1097,7 @@ func constantTimeBearer(r *http.Request, expected string) bool {
 	return len(got) == len(expected) && subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 func (g *Gateway) authorized(r *http.Request) bool {
-	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	got := requestBearer(r)
 	g.keyMu.RLock()
 	defer g.keyMu.RUnlock()
 	for key := range g.keys {
@@ -1077,6 +1107,26 @@ func (g *Gateway) authorized(r *http.Request) bool {
 	}
 	return false
 }
+
+func requestBearer(r *http.Request) string {
+	return strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+}
+
+func maskGatewayKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 8 {
+		return "key_***"
+	}
+	return key[:3] + "..." + key[len(key)-4:]
+}
+
+func auditMetadataFor(r *http.Request) auditMetadata {
+	meta, _ := r.Context().Value(auditMetadataKey{}).(auditMetadata)
+	return meta
+}
+
 func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<20))
 	if err != nil {
@@ -1092,6 +1142,10 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}
 	body = g.normalizeRequestBody(path, body)
 	model := requestModel(path, body)
+	streaming := streamingChatRequest(path, body)
+	meta := auditMetadataFor(r)
+	meta.Stream = streaming
+	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, meta))
 	target := strings.TrimRight(g.cfg.UpstreamURL, "/") + path
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -1115,7 +1169,23 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		}
 		copyHeaders(req.Header, r.Header)
 		req.Header.Set("Authorization", "Bearer "+g.cfg.OpenCodeAPIKey)
-		req.Header.Set("User-Agent", opencodeUserAgent)
+		version := g.cfg.OpenCodeVersion
+		if version == "" {
+			version = opencodeVersion
+		}
+		referer := g.cfg.OpenCodeReferer
+		if referer == "" {
+			referer = opencodeReferer
+		}
+		title := g.cfg.OpenCodeTitle
+		if title == "" {
+			title = opencodeTitle
+		}
+		req.Header.Set("User-Agent", "opencode/"+version)
+		req.Header.Set("HTTP-Referer", referer)
+		req.Header.Set("X-Title", title)
+		// Keep the upstream client identity stable; OPENCODE_CLIENT is retained
+		// for compatibility with older container environments.
 		req.Header.Set("X-OpenCode-Client", opencodeClient)
 		if req.Header.Get("X-OpenCode-Request") == "" {
 			req.Header.Set("X-OpenCode-Request", upstreamRequestID)
@@ -1147,23 +1217,76 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 				resp.Body.Close()
 				continue
 			}
-		} else {
-			g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, "")
 		}
 		defer resp.Body.Close()
 		if g.cfg.FreeModelsOnly && path == "/v1/models" && resp.StatusCode == http.StatusOK {
+			if err := g.copyFilteredModels(w, resp); err != nil {
+				g.handleUpstreamBodyFailure(slot, model, err)
+				g.recordAudit(r, model, http.StatusBadGateway, slot, started, "gateway", attempt+1, "")
+				if errors.Is(err, errUpstreamResponseRead) {
+					http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
+				}
+				return fmt.Errorf("upstream response body: %w", err)
+			}
 			slot.success(model)
 			g.stats.Success.Add(1)
-			return g.copyFilteredModels(w, resp)
+			g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, "")
+			return nil
+		}
+		if !streaming && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			data, readErr := readBufferedResponse(resp.Body)
+			if readErr != nil {
+				g.handleUpstreamBodyFailure(slot, model, readErr)
+				g.recordAudit(r, model, http.StatusBadGateway, slot, started, "gateway", attempt+1, "")
+				if attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) && errors.Is(readErr, errUpstreamResponseRead) {
+					resp.Body.Close()
+					continue
+				}
+				http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
+				return fmt.Errorf("upstream response body: %w", readErr)
+			}
+			copyResponseHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			if _, writeErr := w.Write(data); writeErr != nil {
+				return fmt.Errorf("client response write: %w", writeErr)
+			}
+			slot.success(model)
+			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+				g.stats.Success.Add(1)
+			}
+			g.recordAuditWithUsage(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, "", parseTokenUsage(data), 0)
+			return nil
 		}
 		copyResponseHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		err = copyResponse(w, resp.Body)
+		delayStreamCommit := streaming && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+		if !delayStreamCommit {
+			w.WriteHeader(resp.StatusCode)
+		}
+		usage, firstTokenMS, committed, err := copyResponse(w, resp.Body, started, delayStreamCommit)
+		if err != nil {
+			g.handleUpstreamBodyFailure(slot, model, err)
+			if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+				g.recordAudit(r, model, http.StatusBadGateway, slot, started, "gateway", attempt+1, "")
+			}
+			if delayStreamCommit && !committed && attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) {
+				resp.Body.Close()
+				continue
+			}
+			if delayStreamCommit && !committed {
+				w.Header().Del("Content-Length")
+				w.Header().Del("Content-Encoding")
+				http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
+			}
+			return fmt.Errorf("upstream response body: %w", err)
+		}
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 			slot.success(model)
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 			g.stats.Success.Add(1)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			g.recordAuditWithUsage(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, "", usage, firstTokenMS)
 		}
 		return err
 	}
@@ -1203,10 +1326,44 @@ func requestModel(path string, body []byte) string {
 	return strings.TrimSpace(payload.Model)
 }
 
+func streamingChatRequest(path string, body []byte) bool {
+	if path != "/v1/chat/completions" || len(body) == 0 {
+		return false
+	}
+	var payload struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &payload) == nil && payload.Stream
+}
+
+func (g *Gateway) handleUpstreamBodyFailure(slot *proxySlot, model string, err error) {
+	if slot == nil || !errors.Is(err, errUpstreamResponseRead) {
+		return
+	}
+	// A truncated upstream response is tied to this connection or exit. Close
+	// the pooled connection and cool the slot so the next request uses another
+	// healthy candidate instead of immediately repeating the same failure.
+	slot.client.CloseIdleConnections()
+	slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, 0)
+	if model != "" {
+		slot.cooldownModel(model, g.cfg.CooldownBase, g.cfg.CooldownMax, 0)
+	}
+	failedEgress := ""
+	slot.mu.Lock()
+	failedEgress = slot.egress
+	slot.mu.Unlock()
+	if next, _ := g.selectSlotExcluding(model, map[string]struct{}{slot.identity(): {}}); next != nil {
+		next.mu.Lock()
+		nextEgress := next.egress
+		next.mu.Unlock()
+		g.addLog("warn", "upstream response truncated; switched exit", map[string]any{"previous_egress": failedEgress, "egress": nextEgress, "model": model})
+	}
+}
+
 func (g *Gateway) copyFilteredModels(w http.ResponseWriter, resp *http.Response) error {
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errUpstreamResponseRead, err)
 	}
 	var payload struct {
 		Object string           `json:"object,omitempty"`
@@ -1215,7 +1372,10 @@ func (g *Gateway) copyFilteredModels(w http.ResponseWriter, resp *http.Response)
 	if json.Unmarshal(data, &payload) != nil {
 		w.WriteHeader(resp.StatusCode)
 		_, err = w.Write(data)
-		return err
+		if err != nil {
+			return fmt.Errorf("client response write: %w", err)
+		}
+		return nil
 	}
 	filtered := payload.Data[:0]
 	for _, model := range payload.Data {
@@ -1230,7 +1390,21 @@ func (g *Gateway) copyFilteredModels(w http.ResponseWriter, resp *http.Response)
 	w.Header().Del("Content-Encoding")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	return json.NewEncoder(w).Encode(payload)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		return fmt.Errorf("client response write: %w", err)
+	}
+	return nil
+}
+
+func readBufferedResponse(src io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(src, maxBufferedResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errUpstreamResponseRead, err)
+	}
+	if len(data) > maxBufferedResponseBytes {
+		return nil, fmt.Errorf("upstream response exceeds %d bytes", maxBufferedResponseBytes)
+	}
+	return data, nil
 }
 
 func requestID() string {
@@ -1242,10 +1416,15 @@ func requestID() string {
 }
 
 func (g *Gateway) recordAudit(r *http.Request, model string, status int, slot *proxySlot, started time.Time, source string, attempts int, retryAfter string) {
+	g.recordAuditWithUsage(r, model, status, slot, started, source, attempts, retryAfter, tokenUsage{}, 0)
+}
+
+func (g *Gateway) recordAuditWithUsage(r *http.Request, model string, status int, slot *proxySlot, started time.Time, source string, attempts int, retryAfter string, usage tokenUsage, firstTokenMS int64) {
 	slot.mu.Lock()
 	egress := slot.egress
 	slot.mu.Unlock()
-	record := auditRecord{At: time.Now(), Method: r.Method, Path: r.URL.Path, Model: model, Status: status, Slot: slot.url, Egress: egress, LatencyMS: time.Since(started).Milliseconds(), Source: source, Attempts: attempts, RetryAfter: retryAfter}
+	meta := auditMetadataFor(r)
+	record := auditRecord{At: time.Now(), Method: r.Method, Path: r.URL.Path, Model: model, Status: status, Slot: slot.url, Egress: egress, LatencyMS: time.Since(started).Milliseconds(), Source: source, Attempts: attempts, RetryAfter: retryAfter, ClientKey: meta.ClientKey, Stream: meta.Stream, PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, TotalTokens: usage.TotalTokens, CachedTokens: usage.CachedTokens, FirstTokenMS: firstTokenMS}
 	g.auditMu.Lock()
 	g.audits = append(g.audits, record)
 	if len(g.audits) > 500 {
@@ -1362,26 +1541,154 @@ func copyResponseHeaders(dst, src http.Header) {
 		}
 	}
 }
-func copyResponse(w http.ResponseWriter, src io.Reader) error {
-	buf := make([]byte, 32<<10)
+func copyResponse(w http.ResponseWriter, src io.Reader, started time.Time, delayUntilFirstOutput bool) (tokenUsage, int64, bool, error) {
+	reader := bufio.NewReaderSize(src, 32<<10)
 	flusher, _ := w.(http.Flusher)
+	var usage tokenUsage
+	var firstTokenMS int64
+	seenFinishReason := false
+	var pending strings.Builder
+	committed := false
+	write := func(data string) error {
+		if _, writeErr := io.WriteString(w, data); writeErr != nil {
+			return fmt.Errorf("client response write: %w", writeErr)
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
 	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return writeErr
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			usage = mergeTokenUsage(usage, parseSSETokenUsage(line))
+			hasOutput := sseLineHasOutput(line)
+			if sseLineHasFinishReason(line) {
+				seenFinishReason = true
 			}
-			if flusher != nil {
-				flusher.Flush()
+			if sseLineIsDone(line) && !seenFinishReason {
+				// Some OpenAI-compatible upstreams emit [DONE] without a final
+				// choice carrying finish_reason. Preserve the declared completion
+				// while giving strict clients a standards-compatible terminal chunk.
+				line = `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" + line
+				seenFinishReason = true
+			}
+			if delayUntilFirstOutput && !committed {
+				pending.WriteString(line)
+				if hasOutput {
+					firstTokenMS = time.Since(started).Milliseconds()
+					if writeErr := write(pending.String()); writeErr != nil {
+						return usage, firstTokenMS, false, writeErr
+					}
+					pending.Reset()
+					committed = true
+				}
+			} else {
+				if firstTokenMS == 0 && hasOutput {
+					firstTokenMS = time.Since(started).Milliseconds()
+				}
+				if writeErr := write(line); writeErr != nil {
+					return usage, firstTokenMS, committed, writeErr
+				}
+				committed = true
 			}
 		}
 		if err == io.EOF {
-			return nil
+			if delayUntilFirstOutput && !committed {
+				return usage, firstTokenMS, false, fmt.Errorf("%w: %w", errUpstreamResponseRead, errUpstreamStreamEmpty)
+			}
+			return usage, firstTokenMS, committed, nil
 		}
 		if err != nil {
-			return err
+			return usage, firstTokenMS, committed, fmt.Errorf("%w: %w", errUpstreamResponseRead, err)
 		}
 	}
+}
+
+func sseLineIsDone(line string) bool {
+	line = strings.TrimSpace(line)
+	return strings.HasPrefix(line, "data:") && strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]"
+}
+
+func sseLineHasFinishReason(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	var payload struct {
+		Choices []struct {
+			FinishReason json.RawMessage `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &payload) != nil {
+		return false
+	}
+	for _, choice := range payload.Choices {
+		if value := strings.TrimSpace(string(choice.FinishReason)); value != "" && value != "null" && value != `""` {
+			return true
+		}
+	}
+	return false
+}
+
+func sseLineHasOutput(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	var payload struct {
+		Choices []struct {
+			Delta struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &payload) != nil {
+		return false
+	}
+	for _, choice := range payload.Choices {
+		if choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSSETokenUsage(line string) tokenUsage {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return tokenUsage{}
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return tokenUsage{}
+	}
+	return parseTokenUsage([]byte(payload))
+}
+
+func parseTokenUsage(data []byte) tokenUsage {
+	var payload struct {
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			TotalTokens      int64 `json:"total_tokens"`
+			PromptDetails    struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(data, &payload) != nil {
+		return tokenUsage{}
+	}
+	return tokenUsage{PromptTokens: payload.Usage.PromptTokens, CompletionTokens: payload.Usage.CompletionTokens, TotalTokens: payload.Usage.TotalTokens, CachedTokens: payload.Usage.PromptDetails.CachedTokens}
+}
+
+func mergeTokenUsage(current, next tokenUsage) tokenUsage {
+	if next.PromptTokens != 0 || next.CompletionTokens != 0 || next.TotalTokens != 0 || next.CachedTokens != 0 {
+		return next
+	}
+	return current
 }
 func parseRetryAfter(v string) time.Duration {
 	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {

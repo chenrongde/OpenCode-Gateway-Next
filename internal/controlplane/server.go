@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
@@ -77,21 +78,62 @@ type Server struct {
 	docker           *dockerClient
 	apiMu            sync.Mutex
 	apiInflight      map[string]int
+	apiCircuits      map[string]apiCircuit
+	apiReadiness     map[string]apiReadiness
 	apiCursor        atomic.Uint64
 }
+
+type apiCircuit struct {
+	Failures int
+	Until    time.Time
+}
+
+type apiReadiness struct {
+	Healthy bool
+	Until   time.Time
+}
+
+type observedResponseBody struct {
+	io.ReadCloser
+	onSuccess func()
+	onFailure func()
+	once      sync.Once
+}
+
+func (b *observedResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.once.Do(b.onSuccess)
+	} else if err != nil {
+		b.once.Do(b.onFailure)
+	}
+	return n, err
+}
+
 type AuditRecord struct {
-	At         time.Time `json:"at"`
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	Model      string    `json:"model,omitempty"`
-	Status     int       `json:"status"`
-	Slot       string    `json:"slot"`
-	Egress     string    `json:"egress,omitempty"`
-	LatencyMS  int64     `json:"latency_ms"`
-	Source     string    `json:"source"`
-	Attempts   int       `json:"attempts"`
-	RetryAfter string    `json:"retry_after,omitempty"`
-	Instance   string    `json:"instance"`
+	At               time.Time `json:"at"`
+	Method           string    `json:"method"`
+	Path             string    `json:"path"`
+	Model            string    `json:"model,omitempty"`
+	Status           int       `json:"status"`
+	Slot             string    `json:"slot"`
+	Egress           string    `json:"egress,omitempty"`
+	LatencyMS        int64     `json:"latency_ms"`
+	Source           string    `json:"source"`
+	Attempts         int       `json:"attempts"`
+	RetryAfter       string    `json:"retry_after,omitempty"`
+	ClientKey        string    `json:"client_key,omitempty"`
+	Stream           bool      `json:"stream"`
+	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64     `json:"completion_tokens,omitempty"`
+	TotalTokens      int64     `json:"total_tokens,omitempty"`
+	CachedTokens     int64     `json:"cached_tokens,omitempty"`
+	FirstTokenMS     int64     `json:"first_token_ms,omitempty"`
+	InputCostUSD     float64   `json:"input_cost_usd"`
+	OutputCostUSD    float64   `json:"output_cost_usd"`
+	CacheCostUSD     float64   `json:"cache_cost_usd"`
+	TotalCostUSD     float64   `json:"total_cost_usd"`
+	Instance         string    `json:"instance"`
 }
 type SystemLog struct {
 	At       time.Time      `json:"at"`
@@ -162,7 +204,7 @@ func LoadConfig() (Config, error) {
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), zenKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64)}
+	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), zenKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64)}
 	s.loadKeys()
 	s.loadZenKeys()
 	if len(s.keys) == 0 {
@@ -205,9 +247,9 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
-	selected := selectTrafficPool(instances, s.cfg.DirectFallback)
+	selected := s.readyTrafficPool(selectTrafficPool(instances, s.cfg.DirectFallback))
 	if len(selected) == 0 {
-		http.Error(w, `{"error":"no_gateway_instances"}`, http.StatusServiceUnavailable)
+		http.Error(w, `{"error":"no_healthy_gateway_instances"}`, http.StatusServiceUnavailable)
 		return
 	}
 	instance := s.acquireAPIInstance(selected)
@@ -219,7 +261,20 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 	defer s.releaseAPIInstance(instance.Name)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
+		s.markAPIInstanceFailure(instance.Name)
 		http.Error(w, `{"error":"gateway_unavailable"}`, http.StatusBadGateway)
+	}
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.StatusCode >= http.StatusInternalServerError {
+			s.markAPIInstanceFailure(instance.Name)
+			return nil
+		}
+		response.Body = &observedResponseBody{
+			ReadCloser: response.Body,
+			onSuccess:  func() { s.markAPIInstanceSuccess(instance.Name) },
+			onFailure:  func() { s.markAPIInstanceFailure(instance.Name) },
+		}
+		return nil
 	}
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
@@ -229,9 +284,75 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
+func (s *Server) readyTrafficPool(instances []Instance) []Instance {
+	ready := make([]Instance, 0, len(instances))
+	for _, instance := range instances {
+		if s.apiInstanceReady(instance) {
+			ready = append(ready, instance)
+		}
+	}
+	return ready
+}
+
+func (s *Server) apiInstanceReady(instance Instance) bool {
+	now := time.Now()
+	s.apiMu.Lock()
+	cached, exists := s.apiReadiness[instance.Name]
+	s.apiMu.Unlock()
+	if exists && now.Before(cached.Until) {
+		return cached.Healthy
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(instance.URL, "/")+"/healthz", nil)
+	healthy := false
+	probeError := ""
+	if err == nil {
+		response, requestErr := s.client.Do(req)
+		if requestErr == nil {
+			healthy = response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+			if !healthy {
+				probeError = fmt.Sprintf("healthz returned HTTP %d", response.StatusCode)
+			}
+			response.Body.Close()
+		} else {
+			probeError = requestErr.Error()
+		}
+	} else {
+		probeError = err.Error()
+	}
+	cacheFor := 5 * time.Second
+	if !healthy {
+		cacheFor = time.Second
+	}
+	s.apiMu.Lock()
+	s.apiReadiness[instance.Name] = apiReadiness{Healthy: healthy, Until: time.Now().Add(cacheFor)}
+	s.apiMu.Unlock()
+	if !healthy && (!exists || cached.Healthy) {
+		s.addRotationLog("warn", "gateway health preflight failed", instance.Name, map[string]any{"error": probeError})
+	}
+	return healthy
+}
+
 func (s *Server) acquireAPIInstance(instances []Instance) Instance {
 	s.apiMu.Lock()
 	defer s.apiMu.Unlock()
+	now := time.Now()
+	available := make([]Instance, 0, len(instances))
+	for _, instance := range instances {
+		circuit, exists := s.apiCircuits[instance.Name]
+		if exists && !now.Before(circuit.Until) {
+			delete(s.apiCircuits, instance.Name)
+			exists = false
+		}
+		if !exists {
+			available = append(available, instance)
+		}
+	}
+	if len(available) > 0 {
+		instances = available
+	}
 	var selected Instance
 	selectedLoad := int(^uint(0) >> 1)
 	start := int(s.apiCursor.Add(1)-1) % len(instances)
@@ -246,6 +367,30 @@ func (s *Server) acquireAPIInstance(instances []Instance) Instance {
 	return selected
 }
 
+func (s *Server) markAPIInstanceFailure(name string) {
+	s.apiMu.Lock()
+	defer s.apiMu.Unlock()
+	circuit := s.apiCircuits[name]
+	circuit.Failures++
+	cooldown := 15 * time.Second
+	for step := 1; step < circuit.Failures && cooldown < 2*time.Minute; step++ {
+		cooldown *= 2
+	}
+	if cooldown > 2*time.Minute {
+		cooldown = 2 * time.Minute
+	}
+	circuit.Until = time.Now().Add(cooldown)
+	s.apiCircuits[name] = circuit
+	s.apiReadiness[name] = apiReadiness{Healthy: false, Until: time.Now().Add(time.Second)}
+}
+
+func (s *Server) markAPIInstanceSuccess(name string) {
+	s.apiMu.Lock()
+	delete(s.apiCircuits, name)
+	s.apiReadiness[name] = apiReadiness{Healthy: true, Until: time.Now().Add(5 * time.Second)}
+	s.apiMu.Unlock()
+}
+
 func (s *Server) releaseAPIInstance(name string) {
 	s.apiMu.Lock()
 	defer s.apiMu.Unlock()
@@ -256,7 +401,9 @@ func (s *Server) releaseAPIInstance(name string) {
 	}
 }
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	switch r.URL.Path {
+	case "/", "/instances", "/mihomo", "/keys", "/logs", "/tokens":
+	default:
 		http.NotFound(w, r)
 		return
 	}
@@ -290,6 +437,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/overview" && r.Method == "GET":
 		s.overview(w)
+	case path == "/tokens" && r.Method == "GET":
+		s.tokens(w, r)
 	case path == "/keys" && r.Method == "GET":
 		s.mu.RLock()
 		keys := append([]string(nil), s.keys...)
@@ -710,6 +859,105 @@ func (s *Server) overview(w http.ResponseWriter) {
 		records = records[len(records)-500:]
 	}
 	writeJSON(w, 200, map[string]any{"instances": summaries, "stats": totals, "max_concurrency": totalConcurrency, "records": records, "logs": systemLogs, "log_sources": logSources})
+}
+
+func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
+	instances, err := s.discoverInstances()
+	if err == nil {
+		s.mu.Lock()
+		s.instances = instances
+		s.persistInstancesLocked()
+		s.mu.Unlock()
+	} else {
+		s.mu.RLock()
+		instances = append([]Instance(nil), s.instances...)
+		s.mu.RUnlock()
+	}
+
+	audits := make([][]AuditRecord, len(instances))
+	var wg sync.WaitGroup
+	for index, instance := range instances {
+		if instance.Status != "" && instance.Status != "running" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			audits[index] = s.audit(instance)
+		}()
+	}
+	wg.Wait()
+
+	query := r.URL.Query()
+	instanceFilter := strings.TrimSpace(query.Get("instance"))
+	modelFilter := strings.TrimSpace(query.Get("model"))
+	keyFilter := strings.TrimSpace(query.Get("key"))
+	statusFilter := strings.TrimSpace(query.Get("status"))
+	var records []AuditRecord
+	summary := struct {
+		Requests         int64   `json:"requests"`
+		Success          int64   `json:"success"`
+		Errors           int64   `json:"errors"`
+		PromptTokens     int64   `json:"prompt_tokens"`
+		CompletionTokens int64   `json:"completion_tokens"`
+		TotalTokens      int64   `json:"total_tokens"`
+		CachedTokens     int64   `json:"cached_tokens"`
+		InputCostUSD     float64 `json:"input_cost_usd"`
+		OutputCostUSD    float64 `json:"output_cost_usd"`
+		CacheCostUSD     float64 `json:"cache_cost_usd"`
+		TotalCostUSD     float64 `json:"total_cost_usd"`
+	}{}
+	for _, list := range audits {
+		for _, record := range list {
+			if record.Path != "/v1/chat/completions" {
+				continue
+			}
+			if instanceFilter != "" && record.Instance != instanceFilter || modelFilter != "" && record.Model != modelFilter || keyFilter != "" && record.ClientKey != keyFilter || statusFilter != "" && strconv.Itoa(record.Status) != statusFilter {
+				continue
+			}
+			inputCost, outputCost, cacheCost := tokenCostsUSD(record.Model, record.PromptTokens, record.CompletionTokens, record.CachedTokens)
+			record.InputCostUSD = inputCost
+			record.OutputCostUSD = outputCost
+			record.CacheCostUSD = cacheCost
+			record.TotalCostUSD = inputCost + outputCost + cacheCost
+			records = append(records, record)
+			summary.Requests++
+			if record.Status >= 200 && record.Status < 400 {
+				summary.Success++
+			} else {
+				summary.Errors++
+			}
+			summary.PromptTokens += record.PromptTokens
+			summary.CompletionTokens += record.CompletionTokens
+			summary.TotalTokens += record.TotalTokens
+			summary.CachedTokens += record.CachedTokens
+			summary.InputCostUSD += record.InputCostUSD
+			summary.OutputCostUSD += record.OutputCostUSD
+			summary.CacheCostUSD += record.CacheCostUSD
+			summary.TotalCostUSD += record.TotalCostUSD
+		}
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].At.After(records[j].At) })
+	if len(records) > 500 {
+		records = records[:500]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "records": records})
+}
+
+const tokensPerMillion = 1_000_000.0
+
+func tokenCostsUSD(model string, promptTokens, completionTokens, cachedTokens int64) (input, output, cache float64) {
+	if strings.TrimSuffix(strings.ToLower(strings.TrimSpace(model)), "-free") != "deepseek-v4-flash" {
+		return 0, 0, 0
+	}
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	if cachedTokens > promptTokens {
+		cachedTokens = promptTokens
+	}
+	nonCachedPrompt := promptTokens - cachedTokens
+	return float64(nonCachedPrompt) * 0.14 / tokensPerMillion, float64(completionTokens) * 0.28 / tokensPerMillion, float64(cachedTokens) * 0.0028 / tokensPerMillion
 }
 
 func buildLogSources(instances []Instance, audits [][]AuditRecord, gatewayLogs, containerLogs [][]SystemLog, controlLogs, mihomoLogs []SystemLog) []LogSource {

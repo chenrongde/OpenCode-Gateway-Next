@@ -11,8 +11,11 @@ import (
 )
 
 const (
-	opencodeUserAgent = "opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+	opencodeVersion   = "1.18.16"
+	opencodeUserAgent = "opencode/" + opencodeVersion
 	opencodeClient    = "cli"
+	opencodeReferer   = "https://opencode.ai/"
+	opencodeTitle     = "opencode"
 )
 
 type Config struct {
@@ -35,6 +38,9 @@ type Config struct {
 	CooldownBase       time.Duration
 	CooldownMax        time.Duration
 	OpenCodeClient     string
+	OpenCodeVersion    string
+	OpenCodeReferer    string
+	OpenCodeTitle      string
 	FreeModelsOnly     bool
 	AdminToken         string
 	InstanceAdminToken string
@@ -49,7 +55,7 @@ func DefaultConfig() Config {
 		CooldownMax: 60 * time.Second, ProxyRefresh: 30 * time.Second,
 		ProxyProbeURLs: []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://www.cloudflare.com/cdn-cgi/trace"}, ProxyProbeWait: 10 * time.Second,
 		ProxyProbeJobs: 8, DirectEnabled: true,
-		OpenCodeClient: opencodeClient, FreeModelsOnly: true,
+		OpenCodeClient: opencodeClient, OpenCodeVersion: opencodeVersion, OpenCodeReferer: opencodeReferer, OpenCodeTitle: opencodeTitle, FreeModelsOnly: true,
 		DataDir: "/data",
 	}
 }
@@ -133,6 +139,15 @@ func LoadConfig() (Config, error) {
 	if v := strings.TrimSpace(os.Getenv("OPENCODE_CLIENT")); v != "" {
 		c.OpenCodeClient = v
 	}
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_VERSION")); v != "" {
+		c.OpenCodeVersion = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_REFERER")); v != "" {
+		c.OpenCodeReferer = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_TITLE")); v != "" {
+		c.OpenCodeTitle = v
+	}
 	if v := os.Getenv("FREE_MODELS_ONLY"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -159,6 +174,11 @@ func LoadConfig() (Config, error) {
 	}
 	if c.OpenCodeAPIKey == "" {
 		return c, fmt.Errorf("OPENCODE_API_KEY is required")
+	}
+	for name, value := range map[string]string{"OPENCODE_VERSION": c.OpenCodeVersion, "OPENCODE_REFERER": c.OpenCodeReferer, "OPENCODE_TITLE": c.OpenCodeTitle} {
+		if value == "" || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return c, fmt.Errorf("%s is invalid", name)
+		}
 	}
 	if len(c.OpenCodeAPIKey) > 512 || strings.IndexFunc(c.OpenCodeAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 		return c, fmt.Errorf("OPENCODE_API_KEY is invalid")

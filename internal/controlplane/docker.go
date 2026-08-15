@@ -226,6 +226,9 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, zenA
 		"PROXY_PROBE_CONCURRENCY=" + env("PROXY_PROBE_CONCURRENCY", "8"),
 		"TARGET_EGRESS_SLOTS=" + env("TARGET_EGRESS_SLOTS", "0"),
 		"OPENCODE_CLIENT=" + env("OPENCODE_CLIENT", "desktop"),
+		"OPENCODE_VERSION=" + env("OPENCODE_VERSION", "1.18.16"),
+		"OPENCODE_REFERER=" + env("OPENCODE_REFERER", "https://opencode.ai/"),
+		"OPENCODE_TITLE=" + env("OPENCODE_TITLE", "opencode"),
 		"FREE_MODELS_ONLY=" + env("FREE_MODELS_ONLY", "true"),
 	}
 	labels := map[string]string{
@@ -368,7 +371,7 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 		"COOLDOWN_BASE": env("COOLDOWN_BASE", "5s"), "COOLDOWN_MAX": env("COOLDOWN_MAX", "60s"),
 		"PROXY_PROBE_URL": env("PROXY_PROBE_URL", "https://api.ipify.org,https://ifconfig.me/ip,https://www.cloudflare.com/cdn-cgi/trace"), "PROXY_PROBE_TIMEOUT": env("PROXY_PROBE_TIMEOUT", "10s"),
 		"PROXY_PROBE_CONCURRENCY": env("PROXY_PROBE_CONCURRENCY", "8"), "TARGET_EGRESS_SLOTS": env("TARGET_EGRESS_SLOTS", "0"),
-		"OPENCODE_CLIENT": env("OPENCODE_CLIENT", "desktop"), "FREE_MODELS_ONLY": env("FREE_MODELS_ONLY", "true"),
+		"OPENCODE_CLIENT": env("OPENCODE_CLIENT", "desktop"), "OPENCODE_VERSION": env("OPENCODE_VERSION", "1.18.16"), "OPENCODE_REFERER": env("OPENCODE_REFERER", "https://opencode.ai/"), "OPENCODE_TITLE": env("OPENCODE_TITLE", "opencode"), "FREE_MODELS_ONLY": env("FREE_MODELS_ONLY", "true"),
 	}
 	environment := mergeEnvironment(original.Config.Env, overrides)
 	labels := map[string]string{}

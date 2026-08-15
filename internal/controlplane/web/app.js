@@ -1,4 +1,4 @@
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.4';
 const RELEASE_REPO = 'choateyang/OpenCode-Gateway-Next';
 const token = sessionStorage.getItem('control-token') || prompt('输入 ADMIN_TOKEN');
 if (token) sessionStorage.setItem('control-token', token);
@@ -15,6 +15,29 @@ let state = {};
 let mihomoPage = 0;
 let selectedLogSource = 'control';
 const mihomoPageSize = 10;
+const PAGE_CONFIG = {
+  instances: { title: '实例与出口', eyebrow: 'GATEWAY FLEET / OPERATIONS', subtitle: '集中查看网关实例、当前出口和流量池状态。' },
+  mihomo: { title: 'Mihomo 协议转换', eyebrow: 'PROXY CONVERSION / MIHOMO', subtitle: '管理订阅节点、健康状态和可分配的 SOCKS5 出口。' },
+  keys: { title: '访问密钥', eyebrow: 'ACCESS CONTROL / API KEYS', subtitle: '统一维护客户端访问网关所需的 API 密钥。' },
+  logs: { title: '审计与日志', eyebrow: 'OBSERVABILITY / ACTIVITY', subtitle: '按控制面、Mihomo 和各网关实例查看运行事件。' },
+  tokens: { title: 'API Token 统计', eyebrow: 'USAGE ANALYTICS / TOKENS', subtitle: '按脱敏调用密钥、模型与实例统计 API 响应中的 Token 用量。' },
+};
+
+function currentPage() {
+  const name = window.location.pathname.split('/').filter(Boolean).pop() || 'instances';
+  return PAGE_CONFIG[name] ? name : 'instances';
+}
+
+function initPage() {
+  const page = currentPage();
+  const config = PAGE_CONFIG[page];
+  document.querySelectorAll('[data-page]').forEach(panel => { panel.hidden = panel.dataset.page !== page; });
+  document.querySelector('.metrics').hidden = page === 'tokens';
+  document.querySelectorAll('[data-page-link]').forEach(link => { link.classList.toggle('active', link.dataset.pageLink === page); });
+  $('pageTitle').textContent = config.title;
+  $('pageEyebrow').textContent = config.eyebrow;
+  $('pageSubtitle').textContent = config.subtitle;
+}
 
 function normalizeVersion(value) {
   return String(value || '').replace(/^v/i, '').split('.').map(part => Number.parseInt(part, 10) || 0);
@@ -169,6 +192,67 @@ function renderLogs() {
   }).join('') || '<p class="empty-state">该分类暂无日志</p>';
 }
 
+const formatNumber = value => new Intl.NumberFormat('zh-CN').format(Number(value) || 0);
+const formatUSD = value => `$${(Number(value) || 0).toFixed(6)}`;
+
+function outputSpeed(record) {
+  if (!record.stream || !Number(record.completion_tokens) || !Number(record.first_token_ms)) return '';
+  const generationMS = Number(record.latency_ms) - Number(record.first_token_ms);
+  if (generationMS <= 0) return '';
+  return `${(Number(record.completion_tokens) / (generationMS / 1000)).toFixed(1)} t/s`;
+}
+
+function costDetails(record) {
+  const total = formatUSD(record.total_cost_usd);
+  return `<details class="cost-details"><summary>${total}</summary><div class="cost-popover"><strong>费用明细</strong><div><span>输入费用</span><b>${formatUSD(record.input_cost_usd)}</b></div><div><span>输出费用</span><b>${formatUSD(record.output_cost_usd)}</b></div><div><span>缓存读取费用</span><b>${formatUSD(record.cache_cost_usd)}</b></div><hr><div><span>总费用</span><b>${total}</b></div><small>USD · DeepSeek V4 Flash 按每 1M Tokens 计</small></div></details>`;
+}
+
+function syncTokenFilters(records) {
+  const selections = [
+    ['tokenInstance', records.map(record => record.instance)],
+    ['tokenModel', records.map(record => record.model)],
+    ['tokenKey', records.map(record => record.client_key)],
+  ];
+  selections.forEach(([id, values]) => {
+    const element = $(id);
+    const selected = element.value;
+    const label = id === 'tokenInstance' ? '全部实例' : id === 'tokenModel' ? '全部模型' : '全部密钥';
+    const options = [...new Set(values.filter(Boolean))].sort();
+    element.innerHTML = `<option value="">${label}</option>${options.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('')}`;
+    element.value = options.includes(selected) ? selected : '';
+  });
+}
+
+function tokenQuery() {
+  const params = new URLSearchParams();
+  [['instance', 'tokenInstance'], ['model', 'tokenModel'], ['key', 'tokenKey'], ['status', 'tokenStatus']].forEach(([name, id]) => {
+    const value = $(id).value;
+    if (value) params.set(name, value);
+  });
+  const value = params.toString();
+  return value ? `/tokens?${value}` : '/tokens';
+}
+
+function renderTokens(data) {
+  const summary = data.summary || {};
+  const records = data.records || [];
+  syncTokenFilters(records);
+  $('tokenRequests').textContent = formatNumber(summary.requests);
+  $('tokenSuccess').textContent = `成功 ${formatNumber(summary.success)} · 异常 ${formatNumber(summary.errors)}`;
+  $('tokenTotal').textContent = formatNumber(summary.total_tokens);
+  $('tokenPrompt').textContent = formatNumber(summary.prompt_tokens);
+  $('tokenCompletion').textContent = formatNumber(summary.completion_tokens);
+  $('tokenCached').textContent = formatNumber(summary.cached_tokens);
+  $('tokenCost').textContent = formatUSD(summary.total_cost_usd);
+  $('tokenRows').innerHTML = records.map(record => {
+    const success = Number(record.status) >= 200 && Number(record.status) < 400;
+    const hasUsage = Number(record.total_tokens) || Number(record.prompt_tokens) || Number(record.completion_tokens);
+    const speed = outputSpeed(record);
+    const firstToken = Number(record.first_token_ms) ? `${(Number(record.first_token_ms) / 1000).toFixed(1)}s` : '-';
+    return `<tr><td><time>${esc(displayTime(record.at))}</time><small>${esc(new Date(record.at).toLocaleDateString('zh-CN'))}</small></td><td><strong>${esc(record.instance || '-')}</strong><small class="mono">${esc(record.egress || '出口未知')}</small></td><td><code class="key-chip">${esc(record.client_key || '旧记录')}</code></td><td><span class="model-chip" title="${esc(record.model || '')}">${esc(record.model || '-')}</span></td><td><span class="stream-state ${record.stream ? 'streaming' : ''}">${record.stream ? '流' : '非流'}</span><small>${speed || '-'}</small></td><td class="usage-cell">${hasUsage ? `<strong>${formatNumber(record.prompt_tokens)} / ${formatNumber(record.completion_tokens)}</strong><small>总计 ${formatNumber(record.total_tokens)}${Number(record.cached_tokens) ? ` · 缓存 ${formatNumber(record.cached_tokens)}` : ''}</small>` : '<span class="muted">未返回用量</span>'}</td><td>${costDetails(record)}</td><td><span class="status-chip ${success ? 'ok' : 'bad'}">${Number(record.status) || '-'}</span><small>${esc(record.source || 'upstream')}</small></td><td class="latency-cell"><i class="${success ? 'ok' : 'bad'}"></i><strong>首字 ${firstToken}</strong><small>耗时 ${(Number(record.latency_ms) / 1000).toFixed(1)}s · 第${Number(record.attempts) || 1}次</small></td></tr>`;
+  }).join('') || '<tr><td colspan="9"><p class="empty-state">当前筛选条件下暂无 Token 用量记录</p></td></tr>';
+}
+
 function render() {
   const rows = [];
 	const egressOwners = new Map();
@@ -214,6 +298,7 @@ async function refresh() {
     $('rate').textContent = state.stats.upstream429 || 0;
     $('updated').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
     render();
+    if (currentPage() === 'tokens') renderTokens(await api(tokenQuery()));
   } catch (error) { alert(`刷新失败：${error.message}`); }
 }
 
@@ -231,6 +316,7 @@ $('mihomoNext').onclick = () => { mihomoPage++; renderMihomoEndpoints(); };
 $('refresh').onclick = refresh;
 $('probe').onclick = refresh;
 $('openCreate').onclick = () => $('createDialog').showModal();
+$('tokenFilterApply').onclick = refresh;
 
 $('createForm').onsubmit = async event => {
   if (event.submitter?.value === 'cancel') return;
@@ -291,6 +377,7 @@ document.addEventListener('click', async event => {
 });
 
 initTheme();
+initPage();
 checkForUpdate();
 refresh();
 setInterval(refresh, 10000);

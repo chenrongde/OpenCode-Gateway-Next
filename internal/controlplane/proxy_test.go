@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAPIHandlerReturnsUnavailableWithoutRunningInstances(t *testing.T) {
@@ -22,6 +23,10 @@ func TestAPIHandlerReturnsUnavailableWithoutRunningInstances(t *testing.T) {
 
 func TestAPIHandlerProxiesPathQueryHeadersAndResponse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path != "/v1/chat/completions" || r.URL.RawQuery != "trace=1" {
 			t.Errorf("request URL = %s", r.URL.String())
 		}
@@ -50,9 +55,23 @@ func TestAPIHandlerProxiesPathQueryHeadersAndResponse(t *testing.T) {
 
 func TestAPIHandlerUsesProxyTrafficPool(t *testing.T) {
 	directCalls, proxyCalls := 0, 0
-	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { directCalls++; w.WriteHeader(http.StatusOK) }))
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		directCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
 	defer direct.Close()
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { proxyCalls++; w.WriteHeader(http.StatusOK) }))
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		proxyCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
 	defer proxy.Close()
 	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: false, BootstrapKeys: []string{"gateway-key"}})
 	s.instances = []Instance{
@@ -74,7 +93,7 @@ func TestAPIHandlerReturnsServiceUnavailableWithoutInstances(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	request.Header.Set("Authorization", "Bearer gateway-key")
 	s.APIHandler().ServeHTTP(response, request)
-	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "no_gateway_instances") {
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "no_healthy_gateway_instances") {
 		t.Fatalf("response = %d %s", response.Code, response.Body.String())
 	}
 }
@@ -136,5 +155,130 @@ func TestAcquireAPIInstanceUsesLeastConnectionsAndRoundRobinTies(t *testing.T) {
 	second := s.acquireAPIInstance(instances).Name
 	if first == second {
 		t.Fatalf("round-robin tie selected %q twice", first)
+	}
+}
+
+func TestAcquireAPIInstanceSkipsTemporarilyFailedInstance(t *testing.T) {
+	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s.apiCircuits["gateway-a"] = apiCircuit{Failures: 1, Until: time.Now().Add(time.Minute)}
+	instances := []Instance{{Name: "gateway-a"}, {Name: "gateway-b"}}
+	if got := s.acquireAPIInstance(instances); got.Name != "gateway-b" {
+		t.Fatalf("selected %q, want gateway-b", got.Name)
+	}
+}
+
+func TestAPIHandlerTemporarilySkipsGatewayAfter5xx(t *testing.T) {
+	var failedCalls, healthyCalls int
+	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		failedCalls++
+		http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
+	}))
+	defer failed.Close()
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		healthyCalls++
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer healthy.Close()
+	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: true, BootstrapKeys: []string{"gateway-key"}})
+	s.instances = []Instance{{Name: "gateway-a", URL: failed.URL, Status: "running"}, {Name: "gateway-b", URL: healthy.URL, Status: "running"}}
+	request := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer gateway-key")
+		s.APIHandler().ServeHTTP(response, req)
+		return response
+	}
+	if response := request(); response.Code != http.StatusBadGateway {
+		t.Fatalf("first status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response := request(); response.Code != http.StatusOK || response.Body.String() != `{"ok":true}` {
+		t.Fatalf("second status=%d body=%s", response.Code, response.Body.String())
+	}
+	if failedCalls != 1 || healthyCalls != 1 {
+		t.Fatalf("failed=%d healthy=%d", failedCalls, healthyCalls)
+	}
+}
+
+func TestAPIHandlerSkipsUnhealthyInstanceBeforeFirstRequest(t *testing.T) {
+	var unhealthyRequests, healthyRequests int
+	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+			return
+		}
+		unhealthyRequests++
+		http.Error(w, "should not receive traffic", http.StatusBadGateway)
+	}))
+	defer unhealthy.Close()
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		healthyRequests++
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer healthy.Close()
+
+	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: true, BootstrapKeys: []string{"gateway-key"}})
+	s.instances = []Instance{{Name: "gateway-starting", URL: unhealthy.URL, Status: "running"}, {Name: "gateway-ready", URL: healthy.URL, Status: "running"}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer gateway-key")
+	response := httptest.NewRecorder()
+	s.APIHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || healthyRequests != 1 || unhealthyRequests != 0 {
+		t.Fatalf("status=%d unhealthy=%d healthy=%d body=%s", response.Code, unhealthyRequests, healthyRequests, response.Body.String())
+	}
+}
+
+func TestControlPagesAndTokenStats(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/audit" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"records":[{"at":"2026-08-16T00:00:00Z","method":"POST","path":"/v1/chat/completions","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":true,"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"first_token_ms":250}]}`)
+	}))
+	defer upstream.Close()
+
+	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s.instances = []Instance{{Name: "gateway-a", URL: upstream.URL, Status: "running"}}
+	for _, path := range []string{"/", "/instances", "/mihomo", "/keys", "/logs", "/tokens"} {
+		response := httptest.NewRecorder()
+		s.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "OpenCode Gateway Next") {
+			t.Fatalf("page %s: status=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/tokens", nil)
+	request.Header.Set("Authorization", "Bearer admin")
+	response := httptest.NewRecorder()
+	s.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("token status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Summary struct {
+			Requests     int64   `json:"requests"`
+			TotalTokens  int64   `json:"total_tokens"`
+			PromptTokens int64   `json:"prompt_tokens"`
+			TotalCostUSD float64 `json:"total_cost_usd"`
+		} `json:"summary"`
+		Records []AuditRecord `json:"records"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Requests != 1 || result.Summary.TotalTokens != 20 || result.Summary.PromptTokens != 12 || result.Summary.TotalCostUSD < 3.919e-06 || result.Summary.TotalCostUSD > 3.921e-06 || len(result.Records) != 1 || result.Records[0].ClientKey != "gw_...cdef" || result.Records[0].FirstTokenMS != 250 {
+		t.Fatalf("token response = %#v", result)
 	}
 }
