@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -1006,9 +1007,10 @@ func newGatewayKey() (string, error) {
 }
 func (g *Gateway) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("content-type", "application/json")
+	now := time.Now()
 	for _, slot := range g.snapshotSlots() {
 		slot.mu.Lock()
-		healthy := !slot.disabled && (slot.url == "" || slot.egress != "")
+		healthy := !slot.disabled && !now.Before(slot.until) && (slot.url == "" || slot.egress != "")
 		slot.mu.Unlock()
 		if healthy {
 			w.WriteHeader(http.StatusOK)
@@ -1163,7 +1165,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return nil
 		}
 		tried[slot.identity()] = struct{}{}
-		req, err := http.NewRequestWithContext(ctx, r.Method, target, strings.NewReader(string(body)))
+		req, err := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body))
 		if err != nil {
 			return err
 		}
@@ -1184,9 +1186,11 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		req.Header.Set("User-Agent", "opencode/"+version)
 		req.Header.Set("HTTP-Referer", referer)
 		req.Header.Set("X-Title", title)
-		// Keep the upstream client identity stable; OPENCODE_CLIENT is retained
-		// for compatibility with older container environments.
-		req.Header.Set("X-OpenCode-Client", opencodeClient)
+		client := g.cfg.OpenCodeClient
+		if client == "" {
+			client = opencodeClient
+		}
+		req.Header.Set("X-OpenCode-Client", client)
 		if req.Header.Get("X-OpenCode-Request") == "" {
 			req.Header.Set("X-OpenCode-Request", upstreamRequestID)
 		}

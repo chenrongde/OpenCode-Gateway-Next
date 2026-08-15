@@ -1,4 +1,4 @@
-const APP_VERSION = '1.0.4';
+const APP_VERSION = '1.0.5';
 const RELEASE_REPO = 'choateyang/OpenCode-Gateway-Next';
 const token = sessionStorage.getItem('control-token') || prompt('输入 ADMIN_TOKEN');
 if (token) sessionStorage.setItem('control-token', token);

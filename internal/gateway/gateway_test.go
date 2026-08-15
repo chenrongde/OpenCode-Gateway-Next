@@ -222,6 +222,9 @@ func TestForwardUsesConfiguredZenCPAHeaders(t *testing.T) {
 		if got := r.Header.Get("User-Agent"); got != "opencode/1.4.3" {
 			t.Errorf("user-agent = %q", got)
 		}
+		if got := r.Header.Get("X-OpenCode-Client"); got != "desktop" {
+			t.Errorf("x-opencode-client = %q", got)
+		}
 		if got := r.Header.Get("HTTP-Referer"); got != "https://opencode.ai/" {
 			t.Errorf("http-referer = %q", got)
 		}
@@ -232,6 +235,7 @@ func TestForwardUsesConfiguredZenCPAHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 	c := testConfig(upstream.URL)
+	c.OpenCodeClient = "desktop"
 	c.OpenCodeVersion = "1.4.3"
 	c.OpenCodeReferer = "https://opencode.ai/"
 	c.OpenCodeTitle = "opencode"
@@ -592,6 +596,26 @@ func TestStaticProxyProbeMarksFailuresUnavailableAndHealthNeedsOneHealthySlot(t 
 	g.health(res, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if res.Code != http.StatusOK {
 		t.Fatalf("health status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestHealthReportsUnavailableWhileAllSlotsAreCoolingDown(t *testing.T) {
+	g := &Gateway{slots: []*proxySlot{{
+		url:    "socks5h://mihomo:10801",
+		egress: "192.0.2.10",
+		until:  time.Now().Add(time.Minute),
+	}}}
+	response := httptest.NewRecorder()
+	g.health(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cooling slot health status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	g.slots[0].until = time.Time{}
+	response = httptest.NewRecorder()
+	g.health(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("ready slot health status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
 

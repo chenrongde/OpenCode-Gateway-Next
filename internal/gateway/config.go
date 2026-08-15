@@ -175,7 +175,7 @@ func LoadConfig() (Config, error) {
 	if c.OpenCodeAPIKey == "" {
 		return c, fmt.Errorf("OPENCODE_API_KEY is required")
 	}
-	for name, value := range map[string]string{"OPENCODE_VERSION": c.OpenCodeVersion, "OPENCODE_REFERER": c.OpenCodeReferer, "OPENCODE_TITLE": c.OpenCodeTitle} {
+	for name, value := range map[string]string{"OPENCODE_CLIENT": c.OpenCodeClient, "OPENCODE_VERSION": c.OpenCodeVersion, "OPENCODE_REFERER": c.OpenCodeReferer, "OPENCODE_TITLE": c.OpenCodeTitle} {
 		if value == "" || strings.IndexFunc(value, unicode.IsControl) >= 0 {
 			return c, fmt.Errorf("%s is invalid", name)
 		}

@@ -285,13 +285,35 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) readyTrafficPool(instances []Instance) []Instance {
-	ready := make([]Instance, 0, len(instances))
-	for _, instance := range instances {
-		if s.apiInstanceReady(instance) {
-			ready = append(ready, instance)
+	if len(instances) == 0 {
+		return nil
+	}
+	ready := make([]bool, len(instances))
+	jobs := make(chan int)
+	workers := min(8, len(instances))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				ready[index] = s.apiInstanceReady(instances[index])
+			}
+		}()
+	}
+	for index := range instances {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+
+	result := make([]Instance, 0, len(instances))
+	for index, instance := range instances {
+		if ready[index] {
+			result = append(result, instance)
 		}
 	}
-	return ready
+	return result
 }
 
 func (s *Server) apiInstanceReady(instance Instance) bool {

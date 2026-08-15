@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -236,6 +237,47 @@ func TestAPIHandlerSkipsUnhealthyInstanceBeforeFirstRequest(t *testing.T) {
 	s.APIHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || healthyRequests != 1 || unhealthyRequests != 0 {
 		t.Fatalf("status=%d unhealthy=%d healthy=%d body=%s", response.Code, unhealthyRequests, healthyRequests, response.Body.String())
+	}
+}
+
+func TestReadyTrafficPoolProbesInstancesConcurrently(t *testing.T) {
+	var inflight atomic.Int32
+	var maximum atomic.Int32
+	newGateway := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/healthz" {
+				http.NotFound(w, r)
+				return
+			}
+			current := inflight.Add(1)
+			for {
+				previous := maximum.Load()
+				if current <= previous || maximum.CompareAndSwap(previous, current) {
+					break
+				}
+			}
+			time.Sleep(25 * time.Millisecond)
+			inflight.Add(-1)
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+	servers := []*httptest.Server{newGateway(), newGateway(), newGateway(), newGateway()}
+	defer func() {
+		for _, server := range servers {
+			server.Close()
+		}
+	}()
+
+	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	instances := make([]Instance, 0, len(servers))
+	for index, server := range servers {
+		instances = append(instances, Instance{Name: "gateway-" + string(rune('a'+index)), URL: server.URL, Status: "running"})
+	}
+	if ready := s.readyTrafficPool(instances); len(ready) != len(instances) {
+		t.Fatalf("ready instances = %d, want %d", len(ready), len(instances))
+	}
+	if maximum.Load() < 2 {
+		t.Fatalf("health checks ran sequentially, maximum inflight = %d", maximum.Load())
 	}
 }
 
