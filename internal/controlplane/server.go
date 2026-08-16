@@ -111,29 +111,41 @@ func (b *observedResponseBody) Read(p []byte) (int, error) {
 }
 
 type AuditRecord struct {
-	At               time.Time `json:"at"`
-	Method           string    `json:"method"`
-	Path             string    `json:"path"`
-	Model            string    `json:"model,omitempty"`
-	Status           int       `json:"status"`
-	Slot             string    `json:"slot"`
-	Egress           string    `json:"egress,omitempty"`
-	LatencyMS        int64     `json:"latency_ms"`
-	Source           string    `json:"source"`
-	Attempts         int       `json:"attempts"`
-	RetryAfter       string    `json:"retry_after,omitempty"`
-	ClientKey        string    `json:"client_key,omitempty"`
-	Stream           bool      `json:"stream"`
-	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64     `json:"completion_tokens,omitempty"`
-	TotalTokens      int64     `json:"total_tokens,omitempty"`
-	CachedTokens     int64     `json:"cached_tokens,omitempty"`
-	FirstTokenMS     int64     `json:"first_token_ms,omitempty"`
-	InputCostUSD     float64   `json:"input_cost_usd"`
-	OutputCostUSD    float64   `json:"output_cost_usd"`
-	CacheCostUSD     float64   `json:"cache_cost_usd"`
-	TotalCostUSD     float64   `json:"total_cost_usd"`
-	Instance         string    `json:"instance"`
+	At               time.Time      `json:"at"`
+	RequestID        string         `json:"request_id,omitempty"`
+	Method           string         `json:"method"`
+	Path             string         `json:"path"`
+	Model            string         `json:"model,omitempty"`
+	Status           int            `json:"status"`
+	Slot             string         `json:"slot"`
+	Egress           string         `json:"egress,omitempty"`
+	LatencyMS        int64          `json:"latency_ms"`
+	Source           string         `json:"source"`
+	Attempts         int            `json:"attempts"`
+	RetryAfter       string         `json:"retry_after,omitempty"`
+	ClientKey        string         `json:"client_key,omitempty"`
+	Stream           bool           `json:"stream"`
+	PromptTokens     int64          `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64          `json:"completion_tokens,omitempty"`
+	TotalTokens      int64          `json:"total_tokens,omitempty"`
+	CachedTokens     int64          `json:"cached_tokens,omitempty"`
+	FirstTokenMS     int64          `json:"first_token_ms,omitempty"`
+	InputCostUSD     float64        `json:"input_cost_usd"`
+	OutputCostUSD    float64        `json:"output_cost_usd"`
+	CacheCostUSD     float64        `json:"cache_cost_usd"`
+	TotalCostUSD     float64        `json:"total_cost_usd"`
+	Instance         string         `json:"instance"`
+	Recovered        bool           `json:"recovered,omitempty"`
+	AttemptHistory   []AuditAttempt `json:"attempt_history,omitempty"`
+}
+type AuditAttempt struct {
+	At         time.Time `json:"at"`
+	Status     int       `json:"status"`
+	Egress     string    `json:"egress,omitempty"`
+	Source     string    `json:"source"`
+	Attempt    int       `json:"attempt"`
+	LatencyMS  int64     `json:"latency_ms"`
+	RetryAfter string    `json:"retry_after,omitempty"`
 }
 type SystemLog struct {
 	At       time.Time      `json:"at"`
@@ -841,6 +853,9 @@ func (s *Server) overview(w http.ResponseWriter) {
 		}()
 	}
 	wg.Wait()
+	for index := range audits {
+		audits[index] = collapseAuditRecords(audits[index])
+	}
 	pooled := make(map[string]struct{})
 	for _, instance := range selectTrafficPool(instances, s.cfg.DirectFallback) {
 		pooled[instance.Name] = struct{}{}
@@ -909,6 +924,9 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 	wg.Wait()
+	for index := range audits {
+		audits[index] = collapseAuditRecords(audits[index])
+	}
 
 	query := r.URL.Query()
 	instanceFilter := strings.TrimSpace(query.Get("instance"))
@@ -980,6 +998,69 @@ func tokenCostsUSD(model string, promptTokens, completionTokens, cachedTokens in
 	return float64(nonCachedPrompt) * 0.14 / tokensPerMillion, float64(completionTokens) * 0.28 / tokensPerMillion, float64(cachedTokens) * 0.0028 / tokensPerMillion
 }
 
+func collapseAuditRecords(records []AuditRecord) []AuditRecord {
+	if len(records) < 2 {
+		return records
+	}
+	type group struct {
+		key     string
+		records []AuditRecord
+	}
+	groups := make([]group, 0, len(records))
+	indexes := make(map[string]int, len(records))
+	for index, record := range records {
+		key := strings.TrimSpace(record.RequestID)
+		if key == "" {
+			key = fmt.Sprintf("legacy:%d", index)
+		}
+		groupIndex, exists := indexes[key]
+		if !exists {
+			groupIndex = len(groups)
+			indexes[key] = groupIndex
+			groups = append(groups, group{key: key})
+		}
+		groups[groupIndex].records = append(groups[groupIndex].records, record)
+	}
+
+	result := make([]AuditRecord, 0, len(groups))
+	for _, current := range groups {
+		attempts := current.records
+		sort.SliceStable(attempts, func(i, j int) bool {
+			if attempts[i].Attempts != attempts[j].Attempts {
+				return attempts[i].Attempts < attempts[j].Attempts
+			}
+			return attempts[i].At.Before(attempts[j].At)
+		})
+		final := attempts[len(attempts)-1]
+		earliestStart := final.At.Add(-time.Duration(final.LatencyMS) * time.Millisecond)
+		hadFailure := false
+		maxAttempt := final.Attempts
+		history := make([]AuditAttempt, 0, len(attempts))
+		for _, attempt := range attempts {
+			started := attempt.At.Add(-time.Duration(attempt.LatencyMS) * time.Millisecond)
+			if started.Before(earliestStart) {
+				earliestStart = started
+			}
+			if attempt.Status < 200 || attempt.Status >= 400 {
+				hadFailure = true
+			}
+			if attempt.Attempts > maxAttempt {
+				maxAttempt = attempt.Attempts
+			}
+			history = append(history, AuditAttempt{At: attempt.At, Status: attempt.Status, Egress: attempt.Egress, Source: attempt.Source, Attempt: attempt.Attempts, LatencyMS: attempt.LatencyMS, RetryAfter: attempt.RetryAfter})
+		}
+		final.Attempts = maxAttempt
+		final.LatencyMS = final.At.Sub(earliestStart).Milliseconds()
+		final.Recovered = final.Status >= 200 && final.Status < 400 && hadFailure
+		if len(history) > 1 {
+			final.AttemptHistory = history
+		}
+		result = append(result, final)
+	}
+	sort.SliceStable(result, func(i, j int) bool { return result[i].At.Before(result[j].At) })
+	return result
+}
+
 func buildLogSources(instances []Instance, audits [][]AuditRecord, gatewayLogs, containerLogs [][]SystemLog, controlLogs, mihomoLogs []SystemLog) []LogSource {
 	sources := []LogSource{
 		{ID: "control", Label: "控制面板", Entries: systemLogEntries(controlLogs, "control")},
@@ -992,6 +1073,7 @@ func buildLogSources(instances []Instance, audits [][]AuditRecord, gatewayLogs, 
 				"kind": "audit", "at": record.At, "status": record.Status, "method": record.Method,
 				"path": record.Path, "model": record.Model, "egress": record.Egress, "source": record.Source,
 				"attempts": record.Attempts, "latency_ms": record.LatencyMS, "message": record.Path,
+				"request_id": record.RequestID, "recovered": record.Recovered, "attempt_history": record.AttemptHistory,
 			})
 		}
 		entries = append(entries, systemLogEntries(gatewayLogs[index], "gateway")...)

@@ -1,4 +1,4 @@
-const APP_VERSION = '1.0.6';
+const APP_VERSION = '1.0.10';
 const RELEASE_REPO = 'choateyang/OpenCode-Gateway-Next';
 const token = sessionStorage.getItem('control-token') || prompt('输入 ADMIN_TOKEN');
 if (token) sessionStorage.setItem('control-token', token);
@@ -186,7 +186,13 @@ function renderLogs() {
   const entries = (selected?.entries || []).slice(-120).reverse();
   $('logs').innerHTML = entries.map(entry => {
     if (entry.kind === 'audit') {
-      return `<div class="log audit"><b class="status-${Number(entry.status) >= 400 ? 'bad' : 'ok'}">${Number(entry.status) || 0}</b><span class="mono">${esc(entry.method)} ${esc(entry.path)}${entry.model ? ` · ${esc(entry.model)}` : ''}</span><span>${esc(entry.egress || '出口未知')} · ${esc(entry.source || 'upstream')} · 第${Number(entry.attempts) || 1}次</span><time>${Number(entry.latency_ms) || 0}ms · ${esc(displayTime(entry.at))}</time></div>`;
+      const attempts = Array.isArray(entry.attempt_history) ? entry.attempt_history : [];
+      const attemptCount = Math.max(Number(entry.attempts) || 1, attempts.length || 1);
+      const recovered = Boolean(entry.recovered);
+      const successful = Number(entry.status) >= 200 && Number(entry.status) < 400;
+      const outcome = recovered ? `第${attemptCount}次成功 · 已切换出口` : successful ? `第${attemptCount}次成功` : `第${attemptCount}次失败`;
+      const trace = attempts.length > 1 ? `<details class="attempt-trace"><summary>${attempts.length} 次尝试明细${entry.request_id ? ` · ${esc(String(entry.request_id).slice(0, 8))}` : ''}</summary><div class="attempt-list">${attempts.map(attempt => { const ok = Number(attempt.status) >= 200 && Number(attempt.status) < 400; return `<div class="attempt-row"><b class="status-${ok ? 'ok' : 'bad'}">${Number(attempt.status) || 0}</b><span>第${Number(attempt.attempt) || 1}次 · ${esc(attempt.egress || '出口未知')} · ${esc(attempt.source || 'upstream')}</span><time>${Number(attempt.latency_ms) || 0}ms · ${esc(displayTime(attempt.at))}</time></div>`; }).join('')}</div></details>` : '';
+      return `<div class="log audit ${recovered ? 'recovered' : ''}"><b class="status-${successful ? 'ok' : 'bad'}">${Number(entry.status) || 0}</b><span class="mono log-request">${esc(entry.method)} ${esc(entry.path)}${entry.model ? ` · ${esc(entry.model)}` : ''}</span><span class="log-outcome">${esc(entry.egress || '出口未知')} · ${esc(entry.source || 'upstream')} · ${outcome}</span><time>${Number(entry.latency_ms) || 0}ms · ${esc(displayTime(entry.at))}</time>${trace}</div>`;
     }
     return `<div class="log"><b class="level-${esc(entry.level || 'info')}">${esc(entry.level || entry.kind || 'info')}</b><span class="mono log-message" title="${esc(entry.message || '')}">${esc(entry.message || '-')}</span><time>${esc(displayTime(entry.at))}</time></div>`;
   }).join('') || '<p class="empty-state">该分类暂无日志</p>';
@@ -250,7 +256,8 @@ function renderTokens(data) {
     const hasUsage = Number(record.total_tokens) || Number(record.prompt_tokens) || Number(record.completion_tokens);
     const speed = outputSpeed(record);
     const firstToken = Number(record.first_token_ms) ? `${(Number(record.first_token_ms) / 1000).toFixed(1)}s` : '-';
-    return `<tr><td><time>${esc(displayTime(record.at))}</time><small>${esc(new Date(record.at).toLocaleDateString('zh-CN'))}</small></td><td><strong>${esc(record.instance || '-')}</strong><small class="mono">${esc(record.egress || '出口未知')}</small></td><td><code class="path-chip">${esc(record.path || '-')}</code></td><td><code class="key-chip">${esc(record.client_key || '旧记录')}</code></td><td><span class="model-chip" title="${esc(record.model || '')}">${esc(record.model || '-')}</span></td><td><span class="stream-state ${record.stream ? 'streaming' : ''}">${record.stream ? '流' : '非流'}</span><small>${speed || '-'}</small></td><td class="usage-cell">${hasUsage ? `<strong>${formatNumber(record.prompt_tokens)} / ${formatNumber(record.completion_tokens)}</strong><small>总计 ${formatNumber(record.total_tokens)}${Number(record.cached_tokens) ? ` · 缓存 ${formatNumber(record.cached_tokens)}` : ''}</small>` : '<span class="muted">未返回用量</span>'}</td><td>${costDetails(record)}</td><td><span class="status-chip ${success ? 'ok' : 'bad'}">${Number(record.status) || '-'}</span><small>${esc(record.source || 'upstream')}</small></td><td class="latency-cell"><i class="${success ? 'ok' : 'bad'}"></i><strong>首字 ${firstToken}</strong><small>耗时 ${(Number(record.latency_ms) / 1000).toFixed(1)}s · 第${Number(record.attempts) || 1}次</small></td></tr>`;
+    const recovered = record.recovered ? ' · 已恢复' : '';
+    return `<tr><td><time>${esc(displayTime(record.at))}</time><small>${esc(new Date(record.at).toLocaleDateString('zh-CN'))}</small></td><td><strong>${esc(record.instance || '-')}</strong><small class="mono">${esc(record.egress || '出口未知')}</small></td><td><code class="path-chip">${esc(record.path || '-')}</code></td><td><code class="key-chip">${esc(record.client_key || '旧记录')}</code></td><td><span class="model-chip" title="${esc(record.model || '')}">${esc(record.model || '-')}</span></td><td><span class="stream-state ${record.stream ? 'streaming' : ''}">${record.stream ? '流' : '非流'}</span><small>${speed || '-'}</small></td><td class="usage-cell">${hasUsage ? `<strong>${formatNumber(record.prompt_tokens)} / ${formatNumber(record.completion_tokens)}</strong><small>总计 ${formatNumber(record.total_tokens)}${Number(record.cached_tokens) ? ` · 缓存 ${formatNumber(record.cached_tokens)}` : ''}</small>` : '<span class="muted">未返回用量</span>'}</td><td>${costDetails(record)}</td><td><span class="status-chip ${success ? 'ok' : 'bad'}">${Number(record.status) || '-'}</span><small>${esc(record.source || 'upstream')}${recovered}</small></td><td class="latency-cell"><i class="${success ? 'ok' : 'bad'}"></i><strong>首字 ${firstToken}</strong><small>耗时 ${(Number(record.latency_ms) / 1000).toFixed(1)}s · 第${Number(record.attempts) || 1}次</small></td></tr>`;
   }).join('') || '<tr><td colspan="10"><p class="empty-state">当前筛选条件下暂无接口统计记录</p></td></tr>';
 }
 

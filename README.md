@@ -2,7 +2,7 @@
 
 一个可自托管的 OpenCode Zen API 网关。控制台统一管理动态实例、Zen API Key、代理出口、Mihomo 订阅与请求审计；客户端只需访问一个 OpenAI 兼容 API 地址。
 
-当前版本：**1.0.6**
+当前版本：**1.0.10**
 
 > 上游可用性、额度与限流由 OpenCode 决定。增加实例或出口不等于增加上游账户额度。
 
@@ -103,8 +103,12 @@ socks5h://mihomo:10802
 | `MIHOMO_MAX_SLOTS` | `64` | Mihomo SOCKS5 槽位上限，最大 `128` |
 | `DIRECT_FALLBACK` | `false` | 存在代理实例时是否让直连实例参与分流 |
 | `OPENCODE_CLIENT` | `cli` | 上游 `X-OpenCode-Client` |
+| `DISABLE_THINKING_BY_DEFAULT` | `true` | DeepSeek V4 Flash 未明确指定思考模式时关闭推理，避免输出预算耗尽后正文为空 |
+| `MIN_THINKING_MAX_TOKENS` | `8192` | 显式开启推理时，将较小的总输出预算提升到该值；设为 `0` 关闭保护 |
 
 完整变量说明见 [config.example.env](./config.example.env)。
+
+DeepSeek V4 Flash 默认关闭推理时，网关会同时发送 `thinking: {"type":"disabled"}` 与真正生效的 `reasoning_effort: "none"`。旧客户端只发送 `thinking.disabled` 时，网关也会自动补齐 `reasoning_effort=none`；客户端明确发送 `reasoning_effort=low/high/none` 或 `thinking.enabled` 时保持原值。显式开启推理但预算低于 `MIN_THINKING_MAX_TOKENS` 时，网关会提升 `max_tokens`、`max_completion_tokens` 或 `max_output_tokens`，为正文留出更大概率空间。该参数仍是推理与正文共享的总预算，并非独立 reasoning 上限。AI SDK/OpenCode 配置使用 camelCase 的 `reasoningEffort`，实际 HTTP 字段为 snake_case 的 `reasoning_effort`。
 
 ## 单域名反代
 
@@ -134,6 +138,8 @@ docker ps -a --filter label=opencode.gateway.managed=true
 | 模型返回 `429` | 审计中的 `upstream429`、模型冷却、Zen Key 与上游额度 |
 | `gateway_overloaded` | 实例并发、队列容量、当前请求量 |
 | `unexpected EOF` | 当前出口或节点提前断开；网关会冷却并在可安全重试时切换候选出口 |
+| 返回 `content` 为空但 `reasoning` 已达到上限 | 推理与正文共用 `max_tokens`；关闭推理时明确传入 `reasoning_effort: "none"`，仅传 `thinking.disabled` 的旧请求会由网关自动兼容 |
+| 长请求约 125 秒后返回 Cloudflare `524` | Cloudflare 代理读取超时先于模型完成；缩短任务、关闭推理、拆分请求，或让 API 域名绕过 Cloudflare 代理 |
 | 控制台样式旧 | 重建控制面容器并清理 Nginx/CDN 静态缓存 |
 
 控制台会检查 [choateyang/OpenCode-Gateway-Next](https://github.com/choateyang/OpenCode-Gateway-Next) 的 Release 或 Tag；更新检查失败不影响 API 服务。

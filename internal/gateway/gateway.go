@@ -176,6 +176,7 @@ type Gateway struct {
 
 type auditRecord struct {
 	At               time.Time `json:"at"`
+	RequestID        string    `json:"request_id,omitempty"`
 	Method           string    `json:"method"`
 	Path             string    `json:"path"`
 	Model            string    `json:"model,omitempty"`
@@ -204,6 +205,7 @@ type tokenUsage struct {
 
 type auditMetadata struct {
 	ClientKey string
+	RequestID string
 	Stream    bool
 }
 
@@ -1145,15 +1147,21 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	body = g.normalizeRequestBody(path, body)
 	model := requestModel(body)
 	streaming := streamingRequest(body)
+	gatewayRequestID := requestID()
 	meta := auditMetadataFor(r)
 	meta.Stream = streaming
+	meta.RequestID = gatewayRequestID
 	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, meta))
+	w.Header().Set("X-Gateway-Request-ID", gatewayRequestID)
 	target := strings.TrimRight(g.cfg.UpstreamURL, "/") + path
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 	tried := make(map[string]struct{})
-	upstreamRequestID := requestID()
+	upstreamRequestID := strings.TrimSpace(r.Header.Get("X-OpenCode-Request"))
+	if upstreamRequestID == "" {
+		upstreamRequestID = gatewayRequestID
+	}
 	for attempt := 0; attempt <= g.cfg.MaxRetries; attempt++ {
 		slot, err := g.waitForSlotExcluding(ctx, model, tried)
 		if err != nil {
@@ -1225,7 +1233,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		defer resp.Body.Close()
 		if g.cfg.FreeModelsOnly && path == "/v1/models" && resp.StatusCode == http.StatusOK {
 			if err := g.copyFilteredModels(w, resp); err != nil {
-				g.handleUpstreamBodyFailure(slot, model, err)
+				g.handleUpstreamBodyFailure(r, slot, model, err)
 				g.recordAudit(r, model, http.StatusBadGateway, slot, started, "gateway", attempt+1, "")
 				if errors.Is(err, errUpstreamResponseRead) {
 					http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
@@ -1240,7 +1248,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		if !streaming && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 			data, readErr := readBufferedResponse(resp.Body)
 			if readErr != nil {
-				g.handleUpstreamBodyFailure(slot, model, readErr)
+				g.handleUpstreamBodyFailure(r, slot, model, readErr)
 				g.recordAudit(r, model, http.StatusBadGateway, slot, started, "gateway", attempt+1, "")
 				if attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) && errors.Is(readErr, errUpstreamResponseRead) {
 					resp.Body.Close()
@@ -1268,7 +1276,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		}
 		usage, firstTokenMS, committed, err := copyResponse(w, resp.Body, started, delayStreamCommit)
 		if err != nil {
-			g.handleUpstreamBodyFailure(slot, model, err)
+			g.handleUpstreamBodyFailure(r, slot, model, err)
 			if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 				g.recordAudit(r, model, http.StatusBadGateway, slot, started, "gateway", attempt+1, "")
 			}
@@ -1298,23 +1306,117 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 }
 
 func (g *Gateway) normalizeRequestBody(path string, body []byte) []byte {
-	if !g.cfg.FreeModelsOnly || path != "/v1/chat/completions" || len(body) == 0 {
+	if !supportsReasoningControls(path) || len(body) == 0 {
 		return body
 	}
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
 		return body
 	}
+	changed := false
 	model, _ := payload["model"].(string)
-	if model == "" || model == "big-pickle" || strings.HasSuffix(model, "-free") {
+	if g.cfg.FreeModelsOnly && model != "" && model != "big-pickle" && !strings.HasSuffix(model, "-free") {
+		model += "-free"
+		payload["model"] = model
+		changed = true
+	}
+	if g.cfg.DisableThinkingByDefault && isDeepSeekFlashFree(model) {
+		_, hasReasoningEffort := payload["reasoning_effort"]
+		thinking, hasThinking := payload["thinking"]
+		if !hasReasoningEffort && (!hasThinking || thinkingIsDisabled(thinking)) {
+			payload["reasoning_effort"] = "none"
+			changed = true
+		}
+		if !hasThinking && !hasReasoningEffort {
+			payload["thinking"] = map[string]string{"type": "disabled"}
+			changed = true
+		}
+	}
+	if g.cfg.MinThinkingMaxTokens > 0 && isDeepSeekFlashFree(model) && reasoningIsEnabled(payload) {
+		if raiseThinkingTokenBudget(path, payload, g.cfg.MinThinkingMaxTokens) {
+			changed = true
+		}
+	}
+	if !changed {
 		return body
 	}
-	payload["model"] = model + "-free"
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return body
 	}
 	return encoded
+}
+
+func supportsReasoningControls(path string) bool {
+	return path == "/v1/chat/completions" || path == "/v1/responses"
+}
+
+func thinkingIsDisabled(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		mode, _ := typed["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(mode), "disabled")
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "disabled")
+	case bool:
+		return !typed
+	default:
+		return false
+	}
+}
+
+func reasoningIsEnabled(payload map[string]any) bool {
+	if value, exists := payload["reasoning_effort"]; exists {
+		effort, _ := value.(string)
+		effort = strings.ToLower(strings.TrimSpace(effort))
+		return effort != "" && effort != "none"
+	}
+	value, exists := payload["thinking"]
+	if !exists {
+		return false
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		mode, _ := typed["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(mode), "enabled")
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "enabled")
+	case bool:
+		return typed
+	default:
+		return false
+	}
+}
+
+func raiseThinkingTokenBudget(path string, payload map[string]any, minimum int) bool {
+	keys := []string{"max_tokens", "max_completion_tokens"}
+	defaultKey := "max_tokens"
+	if path == "/v1/responses" {
+		keys = []string{"max_output_tokens"}
+		defaultKey = "max_output_tokens"
+	}
+	changed := false
+	found := false
+	for _, key := range keys {
+		value, exists := payload[key]
+		if !exists {
+			continue
+		}
+		found = true
+		if current, ok := value.(float64); ok && current < float64(minimum) {
+			payload[key] = minimum
+			changed = true
+		}
+	}
+	if !found {
+		payload[defaultKey] = minimum
+		changed = true
+	}
+	return changed
+}
+
+func isDeepSeekFlashFree(model string) bool {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(model)), "-free") == "deepseek-v4-flash"
 }
 
 func requestModel(body []byte) string {
@@ -1340,7 +1442,7 @@ func streamingRequest(body []byte) bool {
 	return json.Unmarshal(body, &payload) == nil && payload.Stream
 }
 
-func (g *Gateway) handleUpstreamBodyFailure(slot *proxySlot, model string, err error) {
+func (g *Gateway) handleUpstreamBodyFailure(r *http.Request, slot *proxySlot, model string, err error) {
 	if slot == nil || !errors.Is(err, errUpstreamResponseRead) {
 		return
 	}
@@ -1360,7 +1462,7 @@ func (g *Gateway) handleUpstreamBodyFailure(slot *proxySlot, model string, err e
 		next.mu.Lock()
 		nextEgress := next.egress
 		next.mu.Unlock()
-		g.addLog("warn", "upstream response truncated; switched exit", map[string]any{"previous_egress": failedEgress, "egress": nextEgress, "model": model})
+		g.addLog("warn", "upstream response truncated; switched exit", map[string]any{"request_id": auditMetadataFor(r).RequestID, "previous_egress": failedEgress, "egress": nextEgress, "model": model})
 	}
 }
 
@@ -1428,7 +1530,7 @@ func (g *Gateway) recordAuditWithUsage(r *http.Request, model string, status int
 	egress := slot.egress
 	slot.mu.Unlock()
 	meta := auditMetadataFor(r)
-	record := auditRecord{At: time.Now(), Method: r.Method, Path: r.URL.Path, Model: model, Status: status, Slot: slot.url, Egress: egress, LatencyMS: time.Since(started).Milliseconds(), Source: source, Attempts: attempts, RetryAfter: retryAfter, ClientKey: meta.ClientKey, Stream: meta.Stream, PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, TotalTokens: usage.TotalTokens, CachedTokens: usage.CachedTokens, FirstTokenMS: firstTokenMS}
+	record := auditRecord{At: time.Now(), RequestID: meta.RequestID, Method: r.Method, Path: r.URL.Path, Model: model, Status: status, Slot: slot.url, Egress: egress, LatencyMS: time.Since(started).Milliseconds(), Source: source, Attempts: attempts, RetryAfter: retryAfter, ClientKey: meta.ClientKey, Stream: meta.Stream, PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens, TotalTokens: usage.TotalTokens, CachedTokens: usage.CachedTokens, FirstTokenMS: firstTokenMS}
 	g.auditMu.Lock()
 	g.audits = append(g.audits, record)
 	if len(g.audits) > 500 {

@@ -217,6 +217,93 @@ func TestForwardOverridesClientOpenCodeHeaders(t *testing.T) {
 	}
 }
 
+func TestNormalizeDeepSeekThinkingControls(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	tests := []struct {
+		name                string
+		path                string
+		body                string
+		wantThinking        string
+		wantReasoningEffort string
+	}{
+		{name: "chat default", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","messages":[]}`, wantThinking: "disabled", wantReasoningEffort: "none"},
+		{name: "responses default", path: "/v1/responses", body: `{"model":"deepseek-v4-flash-free","input":"hello"}`, wantThinking: "disabled", wantReasoningEffort: "none"},
+		{name: "legacy disabled bridge", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","thinking":{"type":"disabled"}}`, wantThinking: "disabled", wantReasoningEffort: "none"},
+		{name: "enabled remains enabled", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","thinking":{"type":"enabled"}}`, wantThinking: "enabled"},
+		{name: "explicit none", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","reasoning_effort":"none"}`, wantReasoningEffort: "none"},
+		{name: "explicit low", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","reasoning_effort":"low"}`, wantReasoningEffort: "low"},
+		{name: "explicit high", path: "/v1/responses", body: `{"model":"deepseek-v4-flash-free","reasoning_effort":"high"}`, wantReasoningEffort: "high"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := g.normalizeRequestBody(tt.path, []byte(tt.body))
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			thinkingType := ""
+			if thinking, ok := payload["thinking"].(map[string]any); ok {
+				thinkingType, _ = thinking["type"].(string)
+			}
+			if thinkingType != tt.wantThinking {
+				t.Fatalf("thinking.type = %q, want %q; payload=%#v", thinkingType, tt.wantThinking, payload)
+			}
+			reasoningEffort, _ := payload["reasoning_effort"].(string)
+			if reasoningEffort != tt.wantReasoningEffort {
+				t.Fatalf("reasoning_effort = %q, want %q; payload=%#v", reasoningEffort, tt.wantReasoningEffort, payload)
+			}
+		})
+	}
+}
+
+func TestNormalizeDeepSeekThinkingCanRemainUnchanged(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.DisableThinkingByDefault = false
+	body := `{"model":"deepseek-v4-flash-free","messages":[]}`
+	if got := string(g.normalizeRequestBody("/v1/chat/completions", []byte(body))); got != body {
+		t.Fatalf("body = %s, want unchanged %s", got, body)
+	}
+}
+
+func TestNormalizeDeepSeekThinkingRaisesLowTokenBudgets(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	tests := []struct {
+		name      string
+		path      string
+		body      string
+		budgetKey string
+		want      float64
+	}{
+		{name: "thinking enabled chat", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","thinking":{"type":"enabled"},"max_tokens":1024}`, budgetKey: "max_tokens", want: 8192},
+		{name: "reasoning high completion budget", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","reasoning_effort":"high","max_completion_tokens":2048}`, budgetKey: "max_completion_tokens", want: 8192},
+		{name: "responses output budget", path: "/v1/responses", body: `{"model":"deepseek-v4-flash-free","reasoning_effort":"low","max_output_tokens":1024}`, budgetKey: "max_output_tokens", want: 8192},
+		{name: "missing chat budget", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","thinking":{"type":"enabled"}}`, budgetKey: "max_tokens", want: 8192},
+		{name: "sufficient budget unchanged", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","reasoning_effort":"high","max_tokens":16384}`, budgetKey: "max_tokens", want: 16384},
+		{name: "reasoning none unchanged", path: "/v1/chat/completions", body: `{"model":"deepseek-v4-flash-free","reasoning_effort":"none","max_tokens":1024}`, budgetKey: "max_tokens", want: 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := g.normalizeRequestBody(tt.path, []byte(tt.body))
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := payload[tt.budgetKey].(float64); got != tt.want {
+				t.Fatalf("%s = %v, want %v; payload=%#v", tt.budgetKey, got, tt.want, payload)
+			}
+		})
+	}
+}
+
+func TestNormalizeDeepSeekThinkingBudgetGuardCanBeDisabled(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.MinThinkingMaxTokens = 0
+	body := `{"model":"deepseek-v4-flash-free","thinking":{"type":"enabled"},"max_tokens":1024}`
+	if got := string(g.normalizeRequestBody("/v1/chat/completions", []byte(body))); got != body {
+		t.Fatalf("body = %s, want unchanged %s", got, body)
+	}
+}
+
 func TestForwardUsesConfiguredZenCPAHeaders(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("User-Agent"); got != "opencode/1.4.3" {
@@ -321,6 +408,9 @@ func TestForwardRetriesNonStreamingTruncatedResponseOnNextEgress(t *testing.T) {
 	if len(audits) != 2 || audits[0].Status != http.StatusBadGateway || audits[1].Status != http.StatusOK || audits[1].Attempts != 2 {
 		t.Fatalf("audits=%#v", audits)
 	}
+	if audits[0].RequestID == "" || audits[0].RequestID != audits[1].RequestID || res.Header().Get("X-Gateway-Request-ID") != audits[0].RequestID {
+		t.Fatalf("request IDs: header=%q audits=%#v", res.Header().Get("X-Gateway-Request-ID"), audits)
+	}
 }
 
 func TestForwardRetriesStreamingResponseBeforeFirstOutput(t *testing.T) {
@@ -356,6 +446,9 @@ func TestForwardRetriesStreamingResponseBeforeFirstOutput(t *testing.T) {
 	g.auditMu.RUnlock()
 	if len(audits) != 2 || audits[0].Status != http.StatusBadGateway || audits[1].Status != http.StatusOK || audits[1].Attempts != 2 {
 		t.Fatalf("audits = %#v", audits)
+	}
+	if audits[0].RequestID == "" || audits[0].RequestID != audits[1].RequestID || res.Header().Get("X-Gateway-Request-ID") != audits[0].RequestID {
+		t.Fatalf("request IDs: header=%q audits=%#v", res.Header().Get("X-Gateway-Request-ID"), audits)
 	}
 }
 

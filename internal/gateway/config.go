@@ -19,32 +19,34 @@ const (
 )
 
 type Config struct {
-	ListenAddr         string
-	UpstreamURL        string
-	OpenCodeAPIKey     string
-	GatewayKeys        []string
-	ProxyURLs          []string
-	ProxyListFile      string
-	ProxyRefresh       time.Duration
-	ProxyProbeURLs     []string
-	ProxyProbeWait     time.Duration
-	ProxyProbeJobs     int
-	TargetEgress       int
-	DirectEnabled      bool
-	MaxConcurrency     int
-	QueueSize          int
-	MaxRetries         int
-	RequestTimeout     time.Duration
-	CooldownBase       time.Duration
-	CooldownMax        time.Duration
-	OpenCodeClient     string
-	OpenCodeVersion    string
-	OpenCodeReferer    string
-	OpenCodeTitle      string
-	FreeModelsOnly     bool
-	AdminToken         string
-	InstanceAdminToken string
-	DataDir            string
+	ListenAddr               string
+	UpstreamURL              string
+	OpenCodeAPIKey           string
+	GatewayKeys              []string
+	ProxyURLs                []string
+	ProxyListFile            string
+	ProxyRefresh             time.Duration
+	ProxyProbeURLs           []string
+	ProxyProbeWait           time.Duration
+	ProxyProbeJobs           int
+	TargetEgress             int
+	DirectEnabled            bool
+	MaxConcurrency           int
+	QueueSize                int
+	MaxRetries               int
+	RequestTimeout           time.Duration
+	CooldownBase             time.Duration
+	CooldownMax              time.Duration
+	OpenCodeClient           string
+	OpenCodeVersion          string
+	OpenCodeReferer          string
+	OpenCodeTitle            string
+	FreeModelsOnly           bool
+	DisableThinkingByDefault bool
+	MinThinkingMaxTokens     int
+	AdminToken               string
+	InstanceAdminToken       string
+	DataDir                  string
 }
 
 func DefaultConfig() Config {
@@ -55,7 +57,7 @@ func DefaultConfig() Config {
 		CooldownMax: 60 * time.Second, ProxyRefresh: 30 * time.Second,
 		ProxyProbeURLs: []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://www.cloudflare.com/cdn-cgi/trace"}, ProxyProbeWait: 10 * time.Second,
 		ProxyProbeJobs: 8, DirectEnabled: true,
-		OpenCodeClient: opencodeClient, OpenCodeVersion: opencodeVersion, OpenCodeReferer: opencodeReferer, OpenCodeTitle: opencodeTitle, FreeModelsOnly: true,
+		OpenCodeClient: opencodeClient, OpenCodeVersion: opencodeVersion, OpenCodeReferer: opencodeReferer, OpenCodeTitle: opencodeTitle, FreeModelsOnly: true, DisableThinkingByDefault: true, MinThinkingMaxTokens: 8192,
 		DataDir: "/data",
 	}
 }
@@ -155,6 +157,16 @@ func LoadConfig() (Config, error) {
 		}
 		c.FreeModelsOnly = b
 	}
+	if v := os.Getenv("DISABLE_THINKING_BY_DEFAULT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return c, fmt.Errorf("DISABLE_THINKING_BY_DEFAULT: %w", err)
+		}
+		c.DisableThinkingByDefault = b
+	}
+	if v := os.Getenv("MIN_THINKING_MAX_TOKENS"); v != "" {
+		c.MinThinkingMaxTokens = nonNegativeInt(v, c.MinThinkingMaxTokens)
+	}
 	c.AdminToken = os.Getenv("ADMIN_TOKEN")
 	c.InstanceAdminToken = os.Getenv("INSTANCE_ADMIN_TOKEN")
 	if c.InstanceAdminToken == "" {
@@ -183,7 +195,7 @@ func LoadConfig() (Config, error) {
 	if len(c.OpenCodeAPIKey) > 512 || strings.IndexFunc(c.OpenCodeAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 		return c, fmt.Errorf("OPENCODE_API_KEY is invalid")
 	}
-	if c.MaxConcurrency < 1 || c.QueueSize < 0 || c.MaxRetries < 0 || c.CooldownBase <= 0 || c.CooldownMax < c.CooldownBase {
+	if c.MaxConcurrency < 1 || c.QueueSize < 0 || c.MaxRetries < 0 || c.MinThinkingMaxTokens < 0 || c.CooldownBase <= 0 || c.CooldownMax < c.CooldownBase {
 		return c, fmt.Errorf("invalid concurrency/retry/cooldown settings")
 	}
 	if c.ProxyRefresh <= 0 || c.ProxyProbeWait <= 0 || c.ProxyProbeJobs <= 0 {

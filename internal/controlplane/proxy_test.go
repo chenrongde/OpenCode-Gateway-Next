@@ -287,7 +287,7 @@ func TestControlPagesAndTokenStats(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = io.WriteString(w, `{"records":[{"at":"2026-08-16T00:00:00Z","method":"POST","path":"/v1/chat/completions","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":true,"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"first_token_ms":250},{"at":"2026-08-16T00:01:00Z","method":"POST","path":"/v1/responses","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":false,"prompt_tokens":15,"completion_tokens":9,"total_tokens":24,"cached_tokens":6}]}`)
+		_, _ = io.WriteString(w, `{"records":[{"at":"2026-08-16T00:00:01Z","request_id":"request-1","method":"POST","path":"/v1/chat/completions","model":"deepseek-v4-flash-free","status":502,"source":"gateway","client_key":"gw_...cdef","stream":true,"attempts":1,"latency_ms":1000},{"at":"2026-08-16T00:00:03Z","request_id":"request-1","method":"POST","path":"/v1/chat/completions","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":true,"attempts":2,"latency_ms":1500,"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"first_token_ms":250},{"at":"2026-08-16T00:01:00Z","request_id":"request-2","method":"POST","path":"/v1/responses","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":false,"attempts":1,"prompt_tokens":15,"completion_tokens":9,"total_tokens":24,"cached_tokens":6}]}`)
 	}))
 	defer upstream.Close()
 
@@ -311,6 +311,7 @@ func TestControlPagesAndTokenStats(t *testing.T) {
 	var result struct {
 		Summary struct {
 			Requests     int64   `json:"requests"`
+			Errors       int64   `json:"errors"`
 			TotalTokens  int64   `json:"total_tokens"`
 			PromptTokens int64   `json:"prompt_tokens"`
 			TotalCostUSD float64 `json:"total_cost_usd"`
@@ -320,7 +321,7 @@ func TestControlPagesAndTokenStats(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary.Requests != 2 || result.Summary.TotalTokens != 44 || result.Summary.PromptTokens != 27 || result.Summary.TotalCostUSD < 7.716e-06 || result.Summary.TotalCostUSD > 7.718e-06 || len(result.Records) != 2 || result.Records[0].Path != "/v1/responses" || result.Records[1].ClientKey != "gw_...cdef" || result.Records[1].FirstTokenMS != 250 {
+	if result.Summary.Requests != 2 || result.Summary.Errors != 0 || result.Summary.TotalTokens != 44 || result.Summary.PromptTokens != 27 || result.Summary.TotalCostUSD < 7.716e-06 || result.Summary.TotalCostUSD > 7.718e-06 || len(result.Records) != 2 || result.Records[0].Path != "/v1/responses" || result.Records[1].ClientKey != "gw_...cdef" || result.Records[1].FirstTokenMS != 250 || !result.Records[1].Recovered || len(result.Records[1].AttemptHistory) != 2 || result.Records[1].LatencyMS != 3000 {
 		t.Fatalf("token response = %#v", result)
 	}
 
