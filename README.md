@@ -2,7 +2,7 @@
 
 一个可自托管的 OpenCode Zen API 网关。控制台统一管理动态实例、Zen API Key、代理出口、Mihomo 订阅与请求审计；客户端只需访问一个 OpenAI 兼容 API 地址。
 
-当前版本：**1.0.5**
+当前版本：**1.0.6**
 
 > 上游可用性、额度与限流由 OpenCode 决定。增加实例或出口不等于增加上游账户额度。
 
@@ -13,7 +13,7 @@
 - 每个实例独立设置 Zen API Key、并发、队列与 HTTP/HTTPS/SOCKS5 出口。
 - 导入 Clash/Mihomo 订阅，将 VLESS、Trojan、Shadowsocks、VMess、Hysteria2 等节点转换为本地 SOCKS5 端口。
 - 实例固定使用当前健康出口；仅在 429、连接故障、出口冲突或手动换线时切换。
-- 审计、日志和 Token 统计按实例、模型、脱敏调用密钥及流式状态分类；支持首字耗时、Token 速度和 USD 费用展示。
+- 审计、日志和 Token 统计覆盖所有已转发接口路径（包括 `/v1/chat/completions`、`/v1/responses` 和模型查询），可按接口、实例、模型、脱敏调用密钥及流式状态筛选；支持首字耗时、Token 速度和 USD 费用展示。
 - 实例启动后通过 `/healthz` 预检，只有健康实例进入统一 API 流量池。
 
 ### 控制台展示

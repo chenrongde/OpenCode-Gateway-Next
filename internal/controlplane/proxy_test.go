@@ -287,7 +287,7 @@ func TestControlPagesAndTokenStats(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = io.WriteString(w, `{"records":[{"at":"2026-08-16T00:00:00Z","method":"POST","path":"/v1/chat/completions","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":true,"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"first_token_ms":250}]}`)
+		_, _ = io.WriteString(w, `{"records":[{"at":"2026-08-16T00:00:00Z","method":"POST","path":"/v1/chat/completions","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":true,"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"first_token_ms":250},{"at":"2026-08-16T00:01:00Z","method":"POST","path":"/v1/responses","model":"deepseek-v4-flash-free","status":200,"source":"upstream","client_key":"gw_...cdef","stream":false,"prompt_tokens":15,"completion_tokens":9,"total_tokens":24,"cached_tokens":6}]}`)
 	}))
 	defer upstream.Close()
 
@@ -320,7 +320,21 @@ func TestControlPagesAndTokenStats(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary.Requests != 1 || result.Summary.TotalTokens != 20 || result.Summary.PromptTokens != 12 || result.Summary.TotalCostUSD < 3.919e-06 || result.Summary.TotalCostUSD > 3.921e-06 || len(result.Records) != 1 || result.Records[0].ClientKey != "gw_...cdef" || result.Records[0].FirstTokenMS != 250 {
+	if result.Summary.Requests != 2 || result.Summary.TotalTokens != 44 || result.Summary.PromptTokens != 27 || result.Summary.TotalCostUSD < 7.716e-06 || result.Summary.TotalCostUSD > 7.718e-06 || len(result.Records) != 2 || result.Records[0].Path != "/v1/responses" || result.Records[1].ClientKey != "gw_...cdef" || result.Records[1].FirstTokenMS != 250 {
 		t.Fatalf("token response = %#v", result)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/tokens?path=%2Fv1%2Fresponses", nil)
+	request.Header.Set("Authorization", "Bearer admin")
+	response = httptest.NewRecorder()
+	s.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("filtered token status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Requests != 1 || result.Summary.TotalTokens != 24 || len(result.Records) != 1 || result.Records[0].Path != "/v1/responses" {
+		t.Fatalf("filtered token response = %#v", result)
 	}
 }

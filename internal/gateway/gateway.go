@@ -1143,8 +1143,8 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		path = "/"
 	}
 	body = g.normalizeRequestBody(path, body)
-	model := requestModel(path, body)
-	streaming := streamingChatRequest(path, body)
+	model := requestModel(body)
+	streaming := streamingRequest(body)
 	meta := auditMetadataFor(r)
 	meta.Stream = streaming
 	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, meta))
@@ -1317,8 +1317,8 @@ func (g *Gateway) normalizeRequestBody(path string, body []byte) []byte {
 	return encoded
 }
 
-func requestModel(path string, body []byte) string {
-	if path != "/v1/chat/completions" || len(body) == 0 {
+func requestModel(body []byte) string {
+	if len(body) == 0 {
 		return ""
 	}
 	var payload struct {
@@ -1330,8 +1330,8 @@ func requestModel(path string, body []byte) string {
 	return strings.TrimSpace(payload.Model)
 }
 
-func streamingChatRequest(path string, body []byte) bool {
-	if path != "/v1/chat/completions" || len(body) == 0 {
+func streamingRequest(body []byte) bool {
+	if len(body) == 0 {
 		return false
 	}
 	var payload struct {
@@ -1641,6 +1641,8 @@ func sseLineHasOutput(line string) bool {
 		return false
 	}
 	var payload struct {
+		Type    string `json:"type"`
+		Delta   string `json:"delta"`
 		Choices []struct {
 			Delta struct {
 				Content          string `json:"content"`
@@ -1650,6 +1652,9 @@ func sseLineHasOutput(line string) bool {
 	}
 	if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &payload) != nil {
 		return false
+	}
+	if payload.Type == "response.output_text.delta" && payload.Delta != "" {
+		return true
 	}
 	for _, choice := range payload.Choices {
 		if choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" {
@@ -1672,20 +1677,49 @@ func parseSSETokenUsage(line string) tokenUsage {
 }
 
 func parseTokenUsage(data []byte) tokenUsage {
+	type usagePayload struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+		InputTokens      int64 `json:"input_tokens"`
+		OutputTokens     int64 `json:"output_tokens"`
+		TotalTokens      int64 `json:"total_tokens"`
+		PromptDetails    struct {
+			CachedTokens int64 `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		InputDetails struct {
+			CachedTokens int64 `json:"cached_tokens"`
+		} `json:"input_tokens_details"`
+	}
 	var payload struct {
-		Usage struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
-			TotalTokens      int64 `json:"total_tokens"`
-			PromptDetails    struct {
-				CachedTokens int64 `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Usage    usagePayload `json:"usage"`
+		Response struct {
+			Usage usagePayload `json:"usage"`
+		} `json:"response"`
 	}
 	if json.Unmarshal(data, &payload) != nil {
 		return tokenUsage{}
 	}
-	return tokenUsage{PromptTokens: payload.Usage.PromptTokens, CompletionTokens: payload.Usage.CompletionTokens, TotalTokens: payload.Usage.TotalTokens, CachedTokens: payload.Usage.PromptDetails.CachedTokens}
+	usage := payload.Usage
+	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		usage = payload.Response.Usage
+	}
+	promptTokens := usage.PromptTokens
+	if promptTokens == 0 {
+		promptTokens = usage.InputTokens
+	}
+	completionTokens := usage.CompletionTokens
+	if completionTokens == 0 {
+		completionTokens = usage.OutputTokens
+	}
+	cachedTokens := usage.PromptDetails.CachedTokens
+	if cachedTokens == 0 {
+		cachedTokens = usage.InputDetails.CachedTokens
+	}
+	totalTokens := usage.TotalTokens
+	if totalTokens == 0 && (promptTokens != 0 || completionTokens != 0) {
+		totalTokens = promptTokens + completionTokens
+	}
+	return tokenUsage{PromptTokens: promptTokens, CompletionTokens: completionTokens, TotalTokens: totalTokens, CachedTokens: cachedTokens}
 }
 
 func mergeTokenUsage(current, next tokenUsage) tokenUsage {

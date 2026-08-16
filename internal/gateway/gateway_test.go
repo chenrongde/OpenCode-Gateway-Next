@@ -822,6 +822,19 @@ func TestTokenUsageParsesRegularAndStreamingResponses(t *testing.T) {
 	if regular != (tokenUsage{PromptTokens: 12, CompletionTokens: 8, TotalTokens: 20, CachedTokens: 4}) {
 		t.Fatalf("regular usage = %#v", regular)
 	}
+	responses := parseTokenUsage([]byte(`{"response":{"usage":{"input_tokens":15,"output_tokens":9,"total_tokens":24,"input_tokens_details":{"cached_tokens":6}}}}`))
+	if responses != (tokenUsage{PromptTokens: 15, CompletionTokens: 9, TotalTokens: 24, CachedTokens: 6}) {
+		t.Fatalf("responses usage = %#v", responses)
+	}
+	if model := requestModel([]byte(`{"model":"deepseek-v4-flash-free","input":"hello"}`)); model != "deepseek-v4-flash-free" {
+		t.Fatalf("responses model = %q", model)
+	}
+	if !streamingRequest([]byte(`{"model":"deepseek-v4-flash-free","input":"hello","stream":true}`)) {
+		t.Fatal("responses stream was not detected")
+	}
+	if !sseLineHasOutput(`data: {"type":"response.output_text.delta","delta":"OK"}`) {
+		t.Fatal("responses output event was not detected")
+	}
 
 	response := httptest.NewRecorder()
 	stream := strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":9,\"total_tokens\":24}}\n\ndata: [DONE]\n\n")
@@ -840,6 +853,22 @@ func TestTokenUsageParsesRegularAndStreamingResponses(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "data: [DONE]") {
 		t.Fatalf("stream was not forwarded: %q", response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	responsesStream := strings.NewReader("event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n")
+	usage, _, committed, err = copyResponse(response, responsesStream, time.Now(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage != (tokenUsage{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5}) {
+		t.Fatalf("responses stream usage = %#v", usage)
+	}
+	if !committed || !strings.Contains(response.Body.String(), `"response.output_text.delta"`) {
+		t.Fatalf("responses stream was not committed: %q", response.Body.String())
 	}
 }
 

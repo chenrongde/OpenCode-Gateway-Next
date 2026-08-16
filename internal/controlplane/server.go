@@ -915,6 +915,7 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	modelFilter := strings.TrimSpace(query.Get("model"))
 	keyFilter := strings.TrimSpace(query.Get("key"))
 	statusFilter := strings.TrimSpace(query.Get("status"))
+	pathFilter := strings.TrimSpace(query.Get("path"))
 	var records []AuditRecord
 	summary := struct {
 		Requests         int64   `json:"requests"`
@@ -931,10 +932,7 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	}{}
 	for _, list := range audits {
 		for _, record := range list {
-			if record.Path != "/v1/chat/completions" {
-				continue
-			}
-			if instanceFilter != "" && record.Instance != instanceFilter || modelFilter != "" && record.Model != modelFilter || keyFilter != "" && record.ClientKey != keyFilter || statusFilter != "" && strconv.Itoa(record.Status) != statusFilter {
+			if instanceFilter != "" && record.Instance != instanceFilter || modelFilter != "" && record.Model != modelFilter || keyFilter != "" && record.ClientKey != keyFilter || statusFilter != "" && strconv.Itoa(record.Status) != statusFilter || pathFilter != "" && record.Path != pathFilter {
 				continue
 			}
 			inputCost, outputCost, cacheCost := tokenCostsUSD(record.Model, record.PromptTokens, record.CompletionTokens, record.CachedTokens)
