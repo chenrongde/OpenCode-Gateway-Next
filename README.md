@@ -2,7 +2,7 @@
 
 一个可自托管的 OpenCode Zen API 网关。控制台统一管理动态实例、Zen API Key、代理出口、Mihomo 订阅与请求审计；客户端只需访问一个 OpenAI 兼容 API 地址。
 
-当前版本：**1.0.10**
+当前版本：**1.0.16**
 
 > 上游可用性、额度与限流由 OpenCode 决定。增加实例或出口不等于增加上游账户额度。
 
@@ -14,6 +14,7 @@
 - 导入 Clash/Mihomo 订阅，将 VLESS、Trojan、Shadowsocks、VMess、Hysteria2 等节点转换为本地 SOCKS5 端口。
 - 实例固定使用当前健康出口；仅在 429、连接故障、出口冲突或手动换线时切换。
 - 审计、日志和 Token 统计覆盖所有已转发接口路径（包括 `/v1/chat/completions`、`/v1/responses` 和模型查询），可按接口、实例、模型、脱敏调用密钥及流式状态筛选；支持首字耗时、Token 速度和 USD 费用展示。
+- `/v1/responses` 为实验性兼容层：网关会尝试将标准 `input`、多轮角色消息与 `instructions` 转换为 Zen 所需的 `messages`，并补齐部分流式生命周期事件；当前不保证所有 OpenAI Responses SDK、工具调用、多模态输入或长流式任务可正常调用。
 - 实例启动后通过 `/healthz` 预检，只有健康实例进入统一 API 流量池。
 
 ### 控制台展示
@@ -68,6 +69,8 @@ curl --no-buffer http://127.0.0.1:13337/v1/chat/completions \
   }'
 ```
 
+> **Responses API 状态：** `/v1/responses` 当前仍不能作为稳定接口使用。部分原生 OpenAI Responses 客户端会因上游 Zen 的请求格式和流式事件差异而失败；生产调用请使用 `/v1/chat/completions`。
+
 客户端 Key 只用于访问网关；每个实例保存的 Zen API Key 才用于访问上游。网关会固定上游请求头：
 
 ```text
@@ -88,7 +91,7 @@ socks5h://mihomo:10802
 
 `vless://`、`trojan://`、`ss://` 分享链接和 Cloudflare `IP:443` 不是实例代理地址，需先由 Mihomo 或其他客户端转换为 HTTP/SOCKS5 服务。
 
-普通请求会保持当前出口。上游 429 会按“实例 + 模型 + 出口”冷却并在健康候选中有限切换；网络错误、响应截断和重复公网出口也会触发换线。已向客户端输出内容的流式响应不会中途重试，以免重复或拼接回复。
+普通请求会保持当前出口。上游 429 会按“实例 + 模型 + 出口”冷却并在健康候选中有限切换；网络错误、响应截断和重复公网出口也会触发换线。流式请求在 `STREAM_FIRST_OUTPUT_TIMEOUT` 内未出现文本、推理、工具调用或 Responses 完成事件时，会冷却当前出口并切换；已向客户端输出内容后不会中途重试，以免重复或拼接回复。
 
 ## 常用配置
 
@@ -105,6 +108,9 @@ socks5h://mihomo:10802
 | `OPENCODE_CLIENT` | `cli` | 上游 `X-OpenCode-Client` |
 | `DISABLE_THINKING_BY_DEFAULT` | `true` | DeepSeek V4 Flash 未明确指定思考模式时关闭推理，避免输出预算耗尽后正文为空 |
 | `MIN_THINKING_MAX_TOKENS` | `8192` | 显式开启推理时，将较小的总输出预算提升到该值；设为 `0` 关闭保护 |
+| `MAX_RETRIES` | `2` | 上游 429、5xx 或首输出前断流后，最多额外尝试的不同出口数 |
+| `STREAM_FIRST_OUTPUT_TIMEOUT` | `20s` | 流式请求等待首个有效事件的最长时间；`0` 关闭 |
+| `STREAM_FAILURE_COOLDOWN` | `10m` | 首输出前断流或超时的出口对当前模型的最低冷却时间；`0` 关闭额外冷却 |
 
 完整变量说明见 [config.example.env](./config.example.env)。
 
@@ -138,6 +144,8 @@ docker ps -a --filter label=opencode.gateway.managed=true
 | 模型返回 `429` | 审计中的 `upstream429`、模型冷却、Zen Key 与上游额度 |
 | `gateway_overloaded` | 实例并发、队列容量、当前请求量 |
 | `unexpected EOF` | 当前出口或节点提前断开；网关会冷却并在可安全重试时切换候选出口 |
+| `/v1/responses` 返回 `405` | 该接口仅接受 `POST`；客户端 Base URL 应为 `https://域名/v1` |
+| 长流式首字前返回 `502` | 当前出口首输出前断流或超时；审计会记录失败出口并自动尝试其余健康出口 |
 | 返回 `content` 为空但 `reasoning` 已达到上限 | 推理与正文共用 `max_tokens`；关闭推理时明确传入 `reasoning_effort: "none"`，仅传 `thinking.disabled` 的旧请求会由网关自动兼容 |
 | 长请求约 125 秒后返回 Cloudflare `524` | Cloudflare 代理读取超时先于模型完成；缩短任务、关闭推理、拆分请求，或让 API 域名绕过 Cloudflare 代理 |
 | 控制台样式旧 | 重建控制面容器并清理 Nginx/CDN 静态缓存 |

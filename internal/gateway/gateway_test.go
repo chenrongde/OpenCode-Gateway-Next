@@ -64,7 +64,9 @@ func TestForwardReplacesClientAuthorizationWithOpenCodeKey(t *testing.T) {
 func TestMethodAllowedRejectsGetChatCompletions(t *testing.T) {
 	for _, path := range []string{
 		"/v1/chat/completions",
+		"/v1/responses",
 		"/openai/v1/chat/completions",
+		"/openai/v1/responses",
 		"/anthropic/v1/chat/completions",
 		"/codex/v1/chat/completions",
 	} {
@@ -80,6 +82,9 @@ func TestMethodAllowedAcceptsModelsGetAndChatPost(t *testing.T) {
 	}
 	if allowed, _ := methodAllowed("/v1/chat/completions", http.MethodPost); !allowed {
 		t.Fatal("POST /v1/chat/completions should be allowed")
+	}
+	if allowed, _ := methodAllowed("/v1/responses", http.MethodPost); !allowed {
+		t.Fatal("POST /v1/responses should be allowed")
 	}
 }
 
@@ -104,6 +109,20 @@ func TestHandlerReturns405ForGetChatCompletions(t *testing.T) {
 	}
 	if body["error"] != "method_not_allowed" || body["method"] != http.MethodGet || body["path"] != "/v1/chat/completions" || body["allow"] != http.MethodPost {
 		t.Fatalf("body = %#v", body)
+	}
+}
+
+func TestHandlerReturns405ForGetResponses(t *testing.T) {
+	g, err := New(testConfig("https://example.com"), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusMethodNotAllowed || res.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("status=%d allow=%q", res.Code, res.Header().Get("Allow"))
 	}
 }
 
@@ -265,6 +284,67 @@ func TestNormalizeDeepSeekThinkingCanRemainUnchanged(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponsesConvertsNativeInputToMessages(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.FreeModelsOnly = false
+	g.cfg.DisableThinkingByDefault = false
+	g.cfg.MinThinkingMaxTokens = 0
+	body := g.normalizeRequestBody("/v1/responses", []byte(`{
+		"model":"model-a",
+		"instructions":"Gateway instructions",
+		"input":[
+			{"role":"system","content":"Rules"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}],"id":"msg_from_client"},
+			{"type":"input_text","text":"standalone content"}
+		]
+	}`))
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["input"]; exists {
+		t.Fatalf("native input was forwarded unchanged: %#v", payload)
+	}
+	if _, exists := payload["instructions"]; exists {
+		t.Fatalf("instructions were not folded into messages: %#v", payload)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	first := messages[0].(map[string]any)
+	if first["role"] != "system" || first["content"] != "Gateway instructions" || first["id"] != "msg_gateway_messages_0" {
+		t.Fatalf("instructions message = %#v", first)
+	}
+	user := messages[2].(map[string]any)
+	if user["role"] != "user" || user["content"] != "Hello" || user["id"] != "msg_from_client" {
+		t.Fatalf("user message = %#v", user)
+	}
+	standalone := messages[3].(map[string]any)
+	if standalone["content"] != "standalone content" || standalone["id"] != "msg_gateway_messages_3" {
+		t.Fatalf("standalone input message = %#v", standalone)
+	}
+}
+
+func TestNormalizeResponsesAddsIDsToLegacyMessages(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.FreeModelsOnly = false
+	g.cfg.DisableThinkingByDefault = false
+	g.cfg.MinThinkingMaxTokens = 0
+	body := g.normalizeRequestBody("/v1/responses", []byte(`{"model":"model-a","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi","id":"msg_client"}]}`))
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	messages := payload["messages"].([]any)
+	if got := messages[0].(map[string]any)["id"]; got != "msg_gateway_messages_0" {
+		t.Fatalf("generated id = %#v", got)
+	}
+	if got := messages[1].(map[string]any)["id"]; got != "msg_client" {
+		t.Fatalf("existing id = %#v", got)
+	}
+}
+
 func TestNormalizeDeepSeekThinkingRaisesLowTokenBudgets(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
 	tests := []struct {
@@ -417,12 +497,18 @@ func TestForwardRetriesStreamingResponseBeforeFirstOutput(t *testing.T) {
 	firstCalls, secondCalls := 0, 0
 	firstClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		firstCalls++
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(&errorReader{err: io.ErrUnexpectedEOF})}, nil
+		header := make(http.Header)
+		header.Set("X-Upstream-Attempt", "first")
+		header.Set("Content-Length", "1")
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(&errorReader{err: io.ErrUnexpectedEOF})}, nil
 	})}
 	secondClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		secondCalls++
 		body := "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n"
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+		header := make(http.Header)
+		header.Set("X-Upstream-Attempt", "second")
+		header.Set("Content-Length", strconv.Itoa(len(body)))
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})}
 	c := testConfig("https://example.com")
 	c.MaxRetries = 1
@@ -441,6 +527,9 @@ func TestForwardRetriesStreamingResponseBeforeFirstOutput(t *testing.T) {
 	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"content":"OK"`) || firstCalls != 1 || secondCalls != 1 {
 		t.Fatalf("status=%d first=%d second=%d body=%s", res.Code, firstCalls, secondCalls, res.Body.String())
 	}
+	if got := res.Header().Values("X-Upstream-Attempt"); len(got) != 1 || got[0] != "second" || res.Header().Get("Content-Length") != "" {
+		t.Fatalf("response headers leaked across retry: %#v", res.Header())
+	}
 	g.auditMu.RLock()
 	audits := append([]auditRecord(nil), g.audits...)
 	g.auditMu.RUnlock()
@@ -449,6 +538,44 @@ func TestForwardRetriesStreamingResponseBeforeFirstOutput(t *testing.T) {
 	}
 	if audits[0].RequestID == "" || audits[0].RequestID != audits[1].RequestID || res.Header().Get("X-Gateway-Request-ID") != audits[0].RequestID {
 		t.Fatalf("request IDs: header=%q audits=%#v", res.Header().Get("X-Gateway-Request-ID"), audits)
+	}
+}
+
+func TestForwardRetriesStreamingResponseAfterFirstOutputTimeout(t *testing.T) {
+	firstCalls, secondCalls := 0, 0
+	firstReader, firstWriter := io.Pipe()
+	defer firstWriter.Close()
+	firstClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		firstCalls++
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: firstReader}, nil
+	})}
+	secondClient := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		secondCalls++
+		body := "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	c := testConfig("https://example.com")
+	c.MaxRetries = 1
+	c.StreamFirstOutputTimeout = 5 * time.Millisecond
+	c.StreamFailureCooldown = time.Minute
+	g, err := New(c, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.slots = []*proxySlot{
+		{client: firstClient, url: "socks5h://proxy:10801", egress: "192.0.2.1"},
+		{client: secondClient, url: "socks5h://proxy:10802", egress: "192.0.2.2"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":true}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"content":"OK"`) || firstCalls != 1 || secondCalls != 1 {
+		t.Fatalf("status=%d first=%d second=%d body=%s", res.Code, firstCalls, secondCalls, res.Body.String())
+	}
+	disabled, ready := g.slots[0].readiness("model-a", time.Now())
+	if disabled || !ready.After(time.Now().Add(30*time.Second)) {
+		t.Fatalf("failed slot was not cooled for stream failure: disabled=%v ready=%s", disabled, ready)
 	}
 }
 
@@ -953,7 +1080,7 @@ func TestTokenUsageParsesRegularAndStreamingResponses(t *testing.T) {
 		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n" +
 		"event: response.completed\n" +
 		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n")
-	usage, _, committed, err = copyResponse(response, responsesStream, time.Now(), true)
+	usage, _, committed, err = copyStreamResponse(response, responsesStream, time.Now(), true, "/v1/responses", "deepseek-v4-flash-free", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -997,6 +1124,239 @@ func TestCopyResponseDoesNotDuplicateUpstreamFinishReason(t *testing.T) {
 	}
 	if count := strings.Count(response.Body.String(), `"finish_reason":"stop"`); count != 1 {
 		t.Fatalf("finish reason count = %d, body = %q", count, response.Body.String())
+	}
+}
+
+func TestResponsesStreamPreservesProtocolAndToolEventsCommit(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("event: response.function_call_arguments.delta\n" +
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"city\\\":\\\"Seoul\\\"}\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n")
+	usage, _, committed, err := copyStreamResponse(response, stream, time.Now(), true, "/v1/responses", "deepseek-v4-flash-free", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed || usage != (tokenUsage{PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5}) {
+		t.Fatalf("committed=%v usage=%#v", committed, usage)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "response.function_call_arguments.delta") || strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Fatalf("responses protocol was changed: %q", body)
+	}
+}
+
+func TestResponsesStreamAddsCreatedSnapshotAndCompletesIt(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"total_tokens\":9}}}\n\n")
+	usage, _, committed, err := copyStreamResponse(response, stream, time.Now(), true, "/v1/responses", "deepseek-v4-flash-free", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed || usage != (tokenUsage{PromptTokens: 7, CompletionTokens: 2, TotalTokens: 9}) {
+		t.Fatalf("committed=%v usage=%#v", committed, usage)
+	}
+	body := response.Body.String()
+	sequence := []string{
+		"event: response.created", "event: response.output_item.added", "event: response.content_part.added",
+		"event: response.output_text.delta", "event: response.output_text.done", "event: response.content_part.done",
+		"event: response.output_item.done", "event: response.completed",
+	}
+	previous := -1
+	for _, event := range sequence {
+		position := strings.Index(body, event)
+		if position < 0 || position <= previous {
+			t.Fatalf("responses event sequence is invalid at %q: %q", event, body)
+		}
+		previous = position
+	}
+	if !strings.HasPrefix(body, "event: response.created\ndata: ") || strings.Count(body, "event: response.created") != 1 {
+		t.Fatalf("created event missing or duplicated: %q", body)
+	}
+	lines := strings.Split(body, "\n")
+	var created, completed struct {
+		Type     string `json:"type"`
+		Response struct {
+			ID     string `json:"id"`
+			Model  string `json:"model"`
+			Status string `json:"status"`
+			Output []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"output"`
+			Usage struct {
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"usage"`
+		} `json:"response"`
+	}
+	for index, line := range lines {
+		if line == "event: response.created" && index+1 < len(lines) {
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[index+1], "data: ")), &created); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if line == "event: response.completed" && index+1 < len(lines) {
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[index+1], "data: ")), &completed); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if created.Type != "response.created" || created.Response.ID == "" || created.Response.Model != "deepseek-v4-flash-free" || created.Response.Status != "in_progress" {
+		t.Fatalf("created snapshot = %#v", created)
+	}
+	if completed.Type != "response.completed" || completed.Response.ID != created.Response.ID || completed.Response.Status != "completed" || completed.Response.Usage.InputTokens != 7 || completed.Response.Usage.OutputTokens != 2 || len(completed.Response.Output) != 1 || completed.Response.Output[0].Content[0].Text != "Hello" {
+		t.Fatalf("completed snapshot = %#v", completed)
+	}
+	var delta struct {
+		Type         string `json:"type"`
+		ItemID       string `json:"item_id"`
+		OutputIndex  int    `json:"output_index"`
+		ContentIndex int    `json:"content_index"`
+		Delta        string `json:"delta"`
+	}
+	for index, line := range lines {
+		if line == "event: response.output_text.delta" && index+1 < len(lines) {
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[index+1], "data: ")), &delta); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if delta.Type != "response.output_text.delta" || delta.ItemID == "" || delta.OutputIndex != 0 || delta.ContentIndex != 0 || delta.Delta != "Hello" {
+		t.Fatalf("delta was not normalized: %#v", delta)
+	}
+}
+
+func TestResponsesStreamDoesNotDuplicateUpstreamCreatedEvent(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"upstream-response\"}}\n\n" +
+		"event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+	_, _, committed, err := copyStreamResponse(response, stream, time.Now(), true, "/v1/responses", "model-a", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed || strings.Count(response.Body.String(), "event: response.created") != 1 {
+		t.Fatalf("created event was duplicated: %q", response.Body.String())
+	}
+}
+
+func TestCopyStreamResponseTimesOutBeforeFirstOutput(t *testing.T) {
+	response := httptest.NewRecorder()
+	_, _, committed, err := copyStreamResponse(response, strings.NewReader(""), time.Now().Add(-time.Second), true, "/v1/chat/completions", "", time.Millisecond)
+	if committed || !errors.Is(err, errUpstreamFirstOutputTimeout) {
+		t.Fatalf("committed=%v err=%v", committed, err)
+	}
+}
+
+func TestCopyStreamResponseRejectsChatEOFWithoutDoneAfterOutput(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+	_, _, committed, err := copyResponse(response, stream, time.Now(), true)
+	if !committed || !errors.Is(err, errUpstreamResponseRead) {
+		t.Fatalf("committed=%v err=%v", committed, err)
+	}
+}
+
+func TestCopyStreamResponseRejectsResponsesEOFWithoutCompleted(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
+	_, _, committed, err := copyStreamResponse(response, stream, time.Now(), true, "/v1/responses", "model-a", time.Second)
+	if !committed || !errors.Is(err, errUpstreamResponseRead) {
+		t.Fatalf("committed=%v err=%v", committed, err)
+	}
+}
+
+func TestNormalizeResponsesRejectsUnsupportedContentPart(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	_, err := g.normalizeRequestBodyChecked("/v1/responses", []byte(`{"model":"model-a","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}]}`))
+	if !errors.Is(err, errUnsupportedResponsesInput) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestResponsesStreamKeepsFunctionCallInCompletedSnapshot(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("event: response.function_call_arguments.delta\n" +
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\\\"Seoul\\\"}\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n")
+	_, _, committed, err := copyStreamResponse(response, stream, time.Now(), true, "/v1/responses", "model-a", time.Second)
+	if err != nil || !committed {
+		t.Fatalf("committed=%v err=%v body=%q", committed, err, response.Body.String())
+	}
+	body := response.Body.String()
+	if strings.Index(body, "event: response.output_item.added") > strings.Index(body, "event: response.function_call_arguments.delta") {
+		t.Fatalf("output item was added after its delta event: %q", body)
+	}
+	if !strings.Contains(body, `"type":"function_call"`) || !strings.Contains(body, `"arguments":"{\"city\":\"Seoul\"}"`) {
+		t.Fatalf("function call was lost from terminal response: %q", body)
+	}
+}
+
+func TestResponsesStreamPreservesCompleteUpstreamSnapshot(t *testing.T) {
+	response := httptest.NewRecorder()
+	stream := strings.NewReader("event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_upstream\",\"model\":\"model-a\",\"output\":[]}}\n\n" +
+		"event: response.output_item.added\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_upstream\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
+		"event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_upstream\",\"output_index\":0,\"content_index\":0,\"delta\":\"OK\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_upstream\",\"model\":\"model-a\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_upstream\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"OK\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n")
+	_, _, committed, err := copyStreamResponse(response, stream, time.Now(), true, "/v1/responses", "model-a", time.Second)
+	if err != nil || !committed {
+		t.Fatalf("committed=%v err=%v body=%q", committed, err, response.Body.String())
+	}
+	body := response.Body.String()
+	if strings.Count(body, "resp_upstream") != 2 || !strings.Contains(body, `"text":"OK"`) {
+		t.Fatalf("upstream completed snapshot was rewritten: %q", body)
+	}
+}
+
+func TestForwardDropsUpstreamContentLengthForTransformedStream(t *testing.T) {
+	body := "event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+	upstream := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Type", "text/event-stream")
+		header.Set("Content-Length", strconv.Itoa(len(body)))
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	c := testConfig("https://example.com")
+	g, err := New(c, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.slots = []*proxySlot{{client: upstream}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"model-a","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	response := httptest.NewRecorder()
+	g.Handler().ServeHTTP(response, req)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Length") != "" || !strings.Contains(response.Body.String(), "response.created") {
+		t.Fatalf("status=%d content-length=%q body=%q", response.Code, response.Header().Get("Content-Length"), response.Body.String())
+	}
+}
+
+func TestHasUntriedSlotIncludesCoolingCandidate(t *testing.T) {
+	g := &Gateway{slots: []*proxySlot{
+		{client: &http.Client{}, url: "socks5h://proxy:10801", egress: "192.0.2.1"},
+		{client: &http.Client{}, url: "socks5h://proxy:10802", egress: "192.0.2.2", until: time.Now().Add(time.Second)},
+	}}
+	excluded := map[string]struct{}{g.slots[0].identity(): {}}
+	if !g.hasUntriedSlot("model-a", excluded) {
+		t.Fatal("cooling alternative must remain eligible for waitForSlotExcluding")
 	}
 }
 

@@ -44,9 +44,11 @@ type cooldownState struct {
 }
 
 var (
-	errNoUntriedSlot        = errors.New("no untried upstream slot")
-	errUpstreamResponseRead = errors.New("upstream response read")
-	errUpstreamStreamEmpty  = errors.New("upstream stream ended before first output")
+	errNoUntriedSlot              = errors.New("no untried upstream slot")
+	errUpstreamResponseRead       = errors.New("upstream response read")
+	errUpstreamStreamEmpty        = errors.New("upstream stream ended before first output")
+	errUpstreamFirstOutputTimeout = errors.New("upstream stream did not produce output before timeout")
+	errUnsupportedResponsesInput  = errors.New("unsupported responses input")
 )
 
 const (
@@ -1087,7 +1089,7 @@ func methodAllowed(path, method string) (bool, string) {
 		path = strings.TrimPrefix(path, prefix)
 	}
 	switch path {
-	case "/v1/chat/completions":
+	case "/v1/chat/completions", "/v1/responses":
 		return method == http.MethodPost, http.MethodPost
 	case "/v1/models":
 		return method == http.MethodGet, http.MethodGet
@@ -1144,7 +1146,11 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if path == "" {
 		path = "/"
 	}
-	body = g.normalizeRequestBody(path, body)
+	body, err = g.normalizeRequestBodyChecked(path, body)
+	if err != nil {
+		g.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_responses_input", "message": err.Error()})
+		return nil
+	}
 	model := requestModel(body)
 	streaming := streamingRequest(body)
 	gatewayRequestID := requestID()
@@ -1153,6 +1159,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	meta.RequestID = gatewayRequestID
 	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, meta))
 	w.Header().Set("X-Gateway-Request-ID", gatewayRequestID)
+	baseResponseHeaders := w.Header().Clone()
 	target := strings.TrimRight(g.cfg.UpstreamURL, "/") + path
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -1163,6 +1170,9 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		upstreamRequestID = gatewayRequestID
 	}
 	for attempt := 0; attempt <= g.cfg.MaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		slot, err := g.waitForSlotExcluding(ctx, model, tried)
 		if err != nil {
 			if errors.Is(err, errNoUntriedSlot) {
@@ -1194,6 +1204,9 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		req.Header.Set("User-Agent", "opencode/"+version)
 		req.Header.Set("HTTP-Referer", referer)
 		req.Header.Set("X-Title", title)
+		// The gateway can add SSE lifecycle events, so it must receive a body it
+		// can forward or transform without preserving a stale encoded length.
+		req.Header.Set("Accept-Encoding", "identity")
 		client := g.cfg.OpenCodeClient
 		if client == "" {
 			client = opencodeClient
@@ -1271,10 +1284,14 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		}
 		copyResponseHeaders(w.Header(), resp.Header)
 		delayStreamCommit := streaming && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+		if delayStreamCommit {
+			w.Header().Del("Content-Length")
+			w.Header().Del("Content-Encoding")
+		}
 		if !delayStreamCommit {
 			w.WriteHeader(resp.StatusCode)
 		}
-		usage, firstTokenMS, committed, err := copyResponse(w, resp.Body, started, delayStreamCommit)
+		usage, firstTokenMS, committed, err := copyStreamResponse(w, resp.Body, started, delayStreamCommit, path, model, g.cfg.StreamFirstOutputTimeout)
 		if err != nil {
 			g.handleUpstreamBodyFailure(r, slot, model, err)
 			if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
@@ -1282,11 +1299,11 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 			}
 			if delayStreamCommit && !committed && attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) {
 				resp.Body.Close()
+				restoreResponseHeaders(w.Header(), baseResponseHeaders)
 				continue
 			}
 			if delayStreamCommit && !committed {
-				w.Header().Del("Content-Length")
-				w.Header().Del("Content-Encoding")
+				restoreResponseHeaders(w.Header(), baseResponseHeaders)
 				http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
 			}
 			return fmt.Errorf("upstream response body: %w", err)
@@ -1305,16 +1322,36 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	return nil
 }
 
+// normalizeRequestBody is retained for focused compatibility tests. The
+// forwarding path uses normalizeRequestBodyChecked so unsupported native
+// Responses input is rejected instead of silently changing its meaning.
 func (g *Gateway) normalizeRequestBody(path string, body []byte) []byte {
+	normalized, _ := g.normalizeRequestBodyChecked(path, body)
+	return normalized
+}
+
+func (g *Gateway) normalizeRequestBodyChecked(path string, body []byte) ([]byte, error) {
 	if !supportsReasoningControls(path) || len(body) == 0 {
-		return body
+		return body, nil
 	}
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
-		return body
+		return body, nil
 	}
 	changed := false
 	model, _ := payload["model"].(string)
+	if path == "/v1/responses" {
+		converted, err := normalizeResponsesInput(payload)
+		if err != nil {
+			return body, err
+		}
+		if converted {
+			changed = true
+		}
+		if normalizeResponsesMessageIDs(payload) {
+			changed = true
+		}
+	}
 	if g.cfg.FreeModelsOnly && model != "" && model != "big-pickle" && !strings.HasSuffix(model, "-free") {
 		model += "-free"
 		payload["model"] = model
@@ -1338,17 +1375,184 @@ func (g *Gateway) normalizeRequestBody(path string, body []byte) []byte {
 		}
 	}
 	if !changed {
-		return body
+		return body, nil
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return body
+		return body, nil
 	}
-	return encoded
+	return encoded, nil
 }
 
 func supportsReasoningControls(path string) bool {
 	return path == "/v1/chat/completions" || path == "/v1/responses"
+}
+
+// Zen's /v1/responses endpoint emits Responses-shaped output but accepts the
+// chat-style messages request contract. Translate standard Responses input at
+// the edge so native Responses clients can use the gateway unchanged.
+func normalizeResponsesInput(payload map[string]any) (bool, error) {
+	input, hasInput := payload["input"]
+	if !hasInput {
+		return false, nil
+	}
+	if _, hasMessages := payload["messages"]; hasMessages {
+		// Legacy clients may deliberately send messages to this endpoint. Keep
+		// that contract intact and only discard the otherwise-invalid input key.
+		delete(payload, "input")
+		return true, nil
+	}
+	messages, err := responsesInputMessages(input)
+	if err != nil {
+		return false, err
+	}
+	if instructions, ok := payload["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		messages = append([]any{map[string]any{"role": "system", "content": instructions}}, messages...)
+	}
+	payload["messages"] = messages
+	delete(payload, "input")
+	delete(payload, "instructions")
+	return true, nil
+}
+
+func responsesInputMessages(input any) ([]any, error) {
+	switch value := input.(type) {
+	case string:
+		return []any{map[string]any{"role": "user", "content": value}}, nil
+	case []any:
+		messages := make([]any, 0, len(value))
+		for _, item := range value {
+			message, ok, err := responsesInputMessage(item)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				messages = append(messages, message)
+			} else {
+				return nil, fmt.Errorf("%w: input item type is not supported", errUnsupportedResponsesInput)
+			}
+		}
+		return messages, nil
+	default:
+		message, ok, err := responsesInputMessage(value)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return []any{message}, nil
+		}
+		return nil, fmt.Errorf("%w: input value is not supported", errUnsupportedResponsesInput)
+	}
+}
+
+func responsesInputMessage(raw any) (map[string]any, bool, error) {
+	item, ok := raw.(map[string]any)
+	if !ok {
+		if text, ok := raw.(string); ok {
+			return map[string]any{"role": "user", "content": text}, true, nil
+		}
+		return nil, false, nil
+	}
+	typeName, _ := item["type"].(string)
+	role, hasRole := item["role"].(string)
+	if hasRole || typeName == "message" {
+		if role == "" {
+			role = "user"
+		}
+		content, err := responsesContent(item["content"])
+		if err != nil {
+			return nil, false, err
+		}
+		message := map[string]any{"role": role, "content": content}
+		if id, ok := item["id"].(string); ok && strings.TrimSpace(id) != "" {
+			message["id"] = id
+		}
+		return message, true, nil
+	}
+	switch typeName {
+	case "function_call_output":
+		content := item["output"]
+		if content == nil {
+			content = item["content"]
+		}
+		converted, err := responsesContent(content)
+		if err != nil {
+			return nil, false, err
+		}
+		message := map[string]any{"role": "tool", "content": converted}
+		if callID, ok := item["call_id"].(string); ok && callID != "" {
+			message["tool_call_id"] = callID
+		}
+		return message, true, nil
+	case "function_call":
+		function := map[string]any{"name": item["name"], "arguments": item["arguments"]}
+		toolCall := map[string]any{"type": "function", "function": function}
+		if callID, ok := item["call_id"].(string); ok && callID != "" {
+			toolCall["id"] = callID
+		}
+		return map[string]any{"role": "assistant", "content": "", "tool_calls": []any{toolCall}}, true, nil
+	default:
+		if text, ok := item["text"].(string); ok {
+			return map[string]any{"role": "user", "content": text}, true, nil
+		}
+		return nil, false, nil
+	}
+}
+
+func responsesContent(content any) (any, error) {
+	parts, ok := content.([]any)
+	if !ok {
+		if content == nil {
+			return "", nil
+		}
+		return content, nil
+	}
+	var text strings.Builder
+	for _, raw := range parts {
+		part, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeName, _ := part["type"].(string)
+		if typeName != "input_text" && typeName != "output_text" && typeName != "text" {
+			return nil, fmt.Errorf("%w: content part %q", errUnsupportedResponsesInput, typeName)
+		}
+		if value, ok := part["text"].(string); ok {
+			text.WriteString(value)
+		}
+	}
+	return text.String(), nil
+}
+
+// Some Responses clients keep conversation history as message-like input
+// objects without IDs. Zen's Responses bridge deserializes that history into
+// its internal messages type, where an ID is mandatory. Add IDs only to those
+// top-level message records and preserve every existing client-provided ID.
+func normalizeResponsesMessageIDs(payload map[string]any) bool {
+	changed := false
+	for _, field := range []string{"messages", "input"} {
+		items, ok := payload[field].([]any)
+		if !ok {
+			continue
+		}
+		for index, raw := range items {
+			message, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			_, hasRole := message["role"]
+			messageType, _ := message["type"].(string)
+			if field == "input" && !hasRole && messageType != "message" {
+				continue
+			}
+			if id, ok := message["id"].(string); ok && strings.TrimSpace(id) != "" {
+				continue
+			}
+			message["id"] = fmt.Sprintf("msg_gateway_%s_%d", field, index)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func thinkingIsDisabled(value any) bool {
@@ -1450,9 +1654,13 @@ func (g *Gateway) handleUpstreamBodyFailure(r *http.Request, slot *proxySlot, mo
 	// the pooled connection and cool the slot so the next request uses another
 	// healthy candidate instead of immediately repeating the same failure.
 	slot.client.CloseIdleConnections()
-	slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, 0)
+	minimum := time.Duration(0)
+	if errors.Is(err, errUpstreamStreamEmpty) || errors.Is(err, errUpstreamFirstOutputTimeout) {
+		minimum = g.cfg.StreamFailureCooldown
+	}
+	slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, minimum)
 	if model != "" {
-		slot.cooldownModel(model, g.cfg.CooldownBase, g.cfg.CooldownMax, 0)
+		slot.cooldownModel(model, g.cfg.CooldownBase, g.cfg.CooldownMax, minimum)
 	}
 	failedEgress := ""
 	slot.mu.Lock()
@@ -1614,10 +1822,9 @@ func (g *Gateway) waitForSlotExcluding(ctx context.Context, model string, exclud
 	}
 }
 func (g *Gateway) hasUntriedSlot(model string, excluded map[string]struct{}) bool {
-	now := time.Now()
 	for _, slot := range g.snapshotSlots() {
-		disabled, ready := slot.readiness(model, now)
-		if disabled || now.Before(ready) {
+		disabled, _ := slot.readiness(model, time.Now())
+		if disabled {
 			continue
 		}
 		if _, tried := excluded[slot.identity()]; !tried {
@@ -1647,14 +1854,598 @@ func copyResponseHeaders(dst, src http.Header) {
 		}
 	}
 }
+
+func restoreResponseHeaders(dst, snapshot http.Header) {
+	clear(dst)
+	for key, values := range snapshot {
+		dst[key] = append([]string(nil), values...)
+	}
+}
+
+// copyResponse remains as a chat-completions compatibility wrapper for callers
+// outside the request forwarder and for focused protocol tests.
 func copyResponse(w http.ResponseWriter, src io.Reader, started time.Time, delayUntilFirstOutput bool) (tokenUsage, int64, bool, error) {
+	return copyStreamResponse(w, src, started, delayUntilFirstOutput, "/v1/chat/completions", "", 0)
+}
+
+type sseLineResult struct {
+	line string
+	err  error
+}
+
+// responsesStreamState fills the minimum lifecycle snapshot expected by strict
+// Responses SDKs when an OpenAI-compatible upstream only emits delta events.
+// Its synthetic response ID is kept stable through the terminal event.
+type responsesStreamState struct {
+	id               string
+	model            string
+	createdAt        int64
+	created          bool
+	upstreamCreated  bool
+	outputAdded      bool
+	contentAdded     bool
+	textDone         bool
+	contentDone      bool
+	outputDone       bool
+	functionArgsDone bool
+	outputIndex      int
+	contentIndex     int
+	itemID           string
+	text             strings.Builder
+	items            map[int]map[string]any
+}
+
+func newResponsesStreamState(model string, started time.Time) *responsesStreamState {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "unknown"
+	}
+	id := "resp_" + requestID()
+	return &responsesStreamState{id: id, model: model, createdAt: started.Unix(), itemID: "msg_" + id, items: make(map[int]map[string]any)}
+}
+
+func responsesSSE(event string, payload any) string {
+	data, _ := json.Marshal(payload)
+	return "event: " + event + "\n" + "data: " + string(data) + "\n\n"
+}
+
+func (s *responsesStreamState) textPart() map[string]any {
+	return map[string]any{"type": "output_text", "text": s.text.String(), "annotations": []any{}}
+}
+
+func (s *responsesStreamState) messageItem(status string, includeContent bool) map[string]any {
+	item := map[string]any{"id": s.itemID, "type": "message", "status": status, "role": "assistant"}
+	if includeContent {
+		item["content"] = []any{s.textPart()}
+	} else {
+		item["content"] = []any{}
+	}
+	return item
+}
+
+func cloneResponseItem(item map[string]any) map[string]any {
+	data, err := json.Marshal(item)
+	if err != nil {
+		return map[string]any{}
+	}
+	var cloned map[string]any
+	if json.Unmarshal(data, &cloned) != nil {
+		return map[string]any{}
+	}
+	return cloned
+}
+
+func (s *responsesStreamState) currentItem() map[string]any {
+	if item := s.items[s.outputIndex]; item != nil {
+		return cloneResponseItem(item)
+	}
+	return s.messageItem("in_progress", false)
+}
+
+func (s *responsesStreamState) outputSnapshot(complete bool) []any {
+	if len(s.items) == 0 {
+		if complete && s.text.Len() > 0 {
+			return []any{s.messageItem("completed", true)}
+		}
+		return []any{}
+	}
+	indexes := make([]int, 0, len(s.items))
+	for index := range s.items {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	output := make([]any, 0, len(indexes))
+	for _, index := range indexes {
+		item := cloneResponseItem(s.items[index])
+		if complete {
+			item["status"] = "completed"
+		}
+		if index == s.outputIndex && item["type"] == "message" && s.text.Len() > 0 {
+			item["content"] = []any{s.textPart()}
+		}
+		output = append(output, item)
+	}
+	return output
+}
+
+func (s *responsesStreamState) snapshot(status string, usage tokenUsage, complete bool) map[string]any {
+	output := []any{}
+	if complete {
+		output = s.outputSnapshot(true)
+	}
+	response := map[string]any{
+		"id": s.id, "object": "response", "created_at": s.createdAt, "status": status, "model": s.model,
+		"output": output, "error": nil, "incomplete_details": nil, "instructions": nil,
+		"max_output_tokens": nil, "parallel_tool_calls": true, "previous_response_id": nil,
+		"reasoning": map[string]any{}, "store": true, "temperature": 1, "tool_choice": "auto",
+		"tools": []any{}, "top_p": 1, "truncation": "disabled", "user": nil, "metadata": map[string]any{},
+	}
+	if complete {
+		response["usage"] = map[string]any{
+			"input_tokens": usage.PromptTokens, "output_tokens": usage.CompletionTokens, "total_tokens": usage.TotalTokens,
+			"input_tokens_details": map[string]any{"cached_tokens": usage.CachedTokens},
+		}
+	} else {
+		response["usage"] = nil
+	}
+	return response
+}
+
+func (s *responsesStreamState) createdEvent() string {
+	return responsesSSE("response.created", map[string]any{"type": "response.created", "response": s.snapshot("in_progress", tokenUsage{}, false)})
+}
+
+func (s *responsesStreamState) outputItemAddedEvent() string {
+	return responsesSSE("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": s.outputIndex, "item": s.currentItem()})
+}
+
+func (s *responsesStreamState) contentPartAddedEvent() string {
+	part := map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
+	return responsesSSE("response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.contentIndex, "part": part})
+}
+
+func (s *responsesStreamState) completionEvents() string {
+	if len(s.items) == 0 && s.text.Len() == 0 {
+		return ""
+	}
+	var events strings.Builder
+	if s.text.Len() > 0 && !s.textDone {
+		events.WriteString(responsesSSE("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.contentIndex, "text": s.text.String()}))
+		s.textDone = true
+	}
+	if s.text.Len() > 0 && !s.contentDone {
+		events.WriteString(responsesSSE("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.contentIndex, "part": s.textPart()}))
+		s.contentDone = true
+	}
+	current := s.currentItem()
+	if current["type"] == "function_call" && !s.functionArgsDone {
+		arguments, _ := current["arguments"].(string)
+		events.WriteString(responsesSSE("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": current["id"], "output_index": s.outputIndex, "arguments": arguments}))
+		s.functionArgsDone = true
+	}
+	if !s.outputDone {
+		item := current
+		item["status"] = "completed"
+		if item["type"] == "message" && s.text.Len() > 0 {
+			item["content"] = []any{s.textPart()}
+		}
+		events.WriteString(responsesSSE("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": s.outputIndex, "item": item}))
+		s.outputDone = true
+	}
+	return events.String()
+}
+
+func (s *responsesStreamState) completedEvent(usage tokenUsage) string {
+	return responsesSSE("response.completed", map[string]any{"type": "response.completed", "response": s.snapshot("completed", usage, true)})
+}
+
+func (s *responsesStreamState) observe(line string) {
+	var payload struct {
+		Type         string `json:"type"`
+		Delta        string `json:"delta"`
+		ItemID       string `json:"item_id"`
+		OutputIndex  *int   `json:"output_index"`
+		ContentIndex *int   `json:"content_index"`
+		Item         struct {
+			ID string `json:"id"`
+		} `json:"item"`
+	}
+	if !parseSSEData(line, &payload) {
+		return
+	}
+	if payload.ItemID != "" {
+		s.itemID = payload.ItemID
+	} else if payload.Item.ID != "" {
+		s.itemID = payload.Item.ID
+	}
+	if payload.OutputIndex != nil {
+		s.outputIndex = *payload.OutputIndex
+	}
+	if payload.ContentIndex != nil {
+		s.contentIndex = *payload.ContentIndex
+	}
+	switch payload.Type {
+	case "response.output_item.added":
+		s.outputAdded = true
+	case "response.content_part.added":
+		s.contentAdded = true
+	case "response.output_text.delta":
+		if payload.Delta != "" {
+			s.text.WriteString(payload.Delta)
+		}
+	case "response.output_text.done":
+		s.textDone = true
+	case "response.content_part.done":
+		s.contentDone = true
+	case "response.output_item.done":
+		s.outputDone = true
+	case "response.function_call_arguments.done":
+		s.functionArgsDone = true
+	}
+	var raw map[string]any
+	if !parseSSEData(line, &raw) {
+		return
+	}
+	item, _ := raw["item"].(map[string]any)
+	switch payload.Type {
+	case "response.output_item.added", "response.output_item.done":
+		if item != nil {
+			s.items[s.outputIndex] = cloneResponseItem(item)
+		}
+	case "response.function_call_arguments.delta":
+		current := s.items[s.outputIndex]
+		if current == nil {
+			current = map[string]any{"id": s.itemID, "type": "function_call", "status": "in_progress", "call_id": s.itemID, "name": "", "arguments": ""}
+			s.items[s.outputIndex] = current
+		}
+		arguments, _ := current["arguments"].(string)
+		current["arguments"] = arguments + payload.Delta
+	}
+}
+
+func (s *responsesStreamState) ensureTextLifecycle() string {
+	var events strings.Builder
+	if !s.outputAdded {
+		events.WriteString(s.outputItemAddedEvent())
+		s.outputAdded = true
+	}
+	if !s.contentAdded {
+		events.WriteString(s.contentPartAddedEvent())
+		s.contentAdded = true
+	}
+	return events.String()
+}
+
+func (s *responsesStreamState) ensureOutputLifecycle() string {
+	if s.outputAdded {
+		return ""
+	}
+	s.outputAdded = true
+	return s.outputItemAddedEvent()
+}
+
+func (s *responsesStreamState) normalizeTextDelta(line string) string {
+	var payload map[string]any
+	if !parseSSEData(line, &payload) || payload["type"] != "response.output_text.delta" {
+		return line
+	}
+	if _, exists := payload["item_id"]; !exists {
+		payload["item_id"] = s.itemID
+	}
+	if _, exists := payload["output_index"]; !exists {
+		payload["output_index"] = s.outputIndex
+	}
+	if _, exists := payload["content_index"]; !exists {
+		payload["content_index"] = s.contentIndex
+	}
+	data, _ := json.Marshal(payload)
+	return "data: " + string(data) + "\n"
+}
+
+func (s *responsesStreamState) observeCreated(line string) {
+	var payload struct {
+		Response struct {
+			ID        string `json:"id"`
+			Model     string `json:"model"`
+			CreatedAt int64  `json:"created_at"`
+		} `json:"response"`
+	}
+	if !parseSSEData(line, &payload) {
+		return
+	}
+	if payload.Response.ID != "" {
+		s.id = payload.Response.ID
+		s.itemID = "msg_" + s.id
+	}
+	if payload.Response.Model != "" {
+		s.model = payload.Response.Model
+	}
+	if payload.Response.CreatedAt > 0 {
+		s.createdAt = payload.Response.CreatedAt
+	}
+}
+
+func parseSSEData(line string, target any) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	return json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), target) == nil
+}
+
+func responsesLineType(line string) string {
+	var payload struct {
+		Type string `json:"type"`
+	}
+	if !parseSSEData(line, &payload) {
+		return ""
+	}
+	return payload.Type
+}
+
+func responsesLineIsCreated(line string) bool {
+	line = strings.TrimSpace(line)
+	return line == "event: response.created" || responsesLineType(line) == "response.created"
+}
+
+func responsesLineIsCompleted(line string) bool {
+	return responsesLineType(line) == "response.completed"
+}
+
+func responsesLineIsTextDelta(line string) bool {
+	return responsesEventName(line) == "response.output_text.delta" || responsesLineType(line) == "response.output_text.delta"
+}
+
+func responsesLineIsFunctionCallDelta(line string) bool {
+	return responsesEventName(line) == "response.function_call_arguments.delta" || responsesLineType(line) == "response.function_call_arguments.delta"
+}
+
+func responsesEventName(line string) string {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "event:") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+}
+
+func responsesLineNeedsCreated(line string) bool {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "event: response.") {
+		return line != "event: response.created"
+	}
+	return strings.HasPrefix(responsesLineType(line), "response.") && responsesLineType(line) != "response.created"
+}
+
+type sseFrame struct {
+	event string
+	data  string
+	raw   string
+}
+
+func readSSEFrame(reader *bufio.Reader) (string, error) {
+	var frame strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			frame.WriteString(line)
+		}
+		if strings.TrimSpace(line) == "" && frame.Len() > 0 {
+			return frame.String(), err
+		}
+		if err != nil {
+			return frame.String(), err
+		}
+	}
+}
+
+func parseSSEFrame(raw string) sseFrame {
+	frame := sseFrame{raw: raw}
+	var data []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			frame.event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	frame.data = strings.Join(data, "\n")
+	return frame
+}
+
+func responseEventPayload(frame sseFrame) (map[string]any, string, bool) {
+	if frame.data == "" || frame.data == "[DONE]" {
+		return nil, "", false
+	}
+	var payload map[string]any
+	if json.Unmarshal([]byte(frame.data), &payload) != nil {
+		return nil, "", false
+	}
+	typeName, _ := payload["type"].(string)
+	if typeName == "" {
+		typeName = frame.event
+	}
+	return payload, typeName, strings.HasPrefix(typeName, "response.")
+}
+
+func responsesCompletedHasOutput(payload map[string]any) bool {
+	response, _ := payload["response"].(map[string]any)
+	output, _ := response["output"].([]any)
+	return len(output) > 0
+}
+
+func (s *responsesStreamState) normalizeTextDeltaPayload(payload map[string]any) map[string]any {
+	if _, exists := payload["item_id"]; !exists {
+		payload["item_id"] = s.itemID
+	}
+	if _, exists := payload["output_index"]; !exists {
+		payload["output_index"] = s.outputIndex
+	}
+	if _, exists := payload["content_index"]; !exists {
+		payload["content_index"] = s.contentIndex
+	}
+	return payload
+}
+
+// copyResponsesStreamResponse operates on complete SSE events rather than
+// independent lines. It keeps event headers coupled to their data payloads,
+// which is required when lifecycle events are inserted for strict SDKs.
+func copyResponsesStreamResponse(w http.ResponseWriter, src io.Reader, started time.Time, delayUntilFirstOutput bool, model string, firstOutputTimeout time.Duration) (tokenUsage, int64, bool, error) {
+	reader := bufio.NewReaderSize(src, 32<<10)
+	flusher, _ := w.(http.Flusher)
+	responses := newResponsesStreamState(model, started)
+	var usage tokenUsage
+	var firstTokenMS int64
+	committed := false
+	seenCompleted := false
+	seenTerminalFailure := false
+	var pending strings.Builder
+	write := func(data string) error {
+		if _, err := io.WriteString(w, data); err != nil {
+			return fmt.Errorf("client response write: %w", err)
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+	readFrame := func() (string, error) {
+		if !delayUntilFirstOutput || committed || firstOutputTimeout <= 0 {
+			return readSSEFrame(reader)
+		}
+		remaining := time.Until(started.Add(firstOutputTimeout))
+		if remaining <= 0 {
+			return "", errUpstreamFirstOutputTimeout
+		}
+		result := make(chan sseLineResult, 1)
+		go func() {
+			raw, err := readSSEFrame(reader)
+			result <- sseLineResult{line: raw, err: err}
+		}()
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case result := <-result:
+			return result.line, result.err
+		case <-timer.C:
+			return "", errUpstreamFirstOutputTimeout
+		}
+	}
+	for {
+		raw, readErr := readFrame()
+		if raw != "" {
+			frame := parseSSEFrame(raw)
+			payload, typeName, isResponseEvent := responseEventPayload(frame)
+			out := raw
+			hasOutput := false
+			if isResponseEvent {
+				dataLine := "data: " + frame.data
+				if typeName == "response.created" {
+					responses.created = true
+					responses.upstreamCreated = true
+					responses.observeCreated(dataLine)
+				} else {
+					responses.observe(dataLine)
+					var injected strings.Builder
+					if !responses.created {
+						injected.WriteString(responses.createdEvent())
+						responses.created = true
+					}
+					switch typeName {
+					case "response.output_text.delta":
+						injected.WriteString(responses.ensureTextLifecycle())
+						payload = responses.normalizeTextDeltaPayload(payload)
+					case "response.function_call_arguments.delta":
+						injected.WriteString(responses.ensureOutputLifecycle())
+					case "response.completed":
+						seenCompleted = true
+						usage = mergeTokenUsage(usage, parseSSETokenUsage(dataLine))
+						if !responsesCompletedHasOutput(payload) {
+							injected.WriteString(responses.completionEvents())
+							out = injected.String() + responses.completedEvent(usage)
+						} else {
+							injected.WriteString(responses.completionEvents())
+							if !responses.upstreamCreated {
+								if response, ok := payload["response"].(map[string]any); ok {
+									response["id"] = responses.id
+									if _, hasModel := response["model"]; !hasModel {
+										response["model"] = responses.model
+									}
+								}
+							}
+							out = injected.String() + responsesSSE(typeName, payload)
+						}
+					case "response.failed", "response.incomplete":
+						seenTerminalFailure = true
+					}
+					if typeName != "response.completed" {
+						out = injected.String() + responsesSSE(typeName, payload)
+					}
+				}
+				usage = mergeTokenUsage(usage, parseSSETokenUsage("data: "+frame.data))
+				hasOutput = sseLineHasOutputForPath("data: "+frame.data, true)
+			}
+			if delayUntilFirstOutput && !committed {
+				pending.WriteString(out)
+				if hasOutput {
+					firstTokenMS = time.Since(started).Milliseconds()
+					if err := write(pending.String()); err != nil {
+						return usage, firstTokenMS, false, err
+					}
+					pending.Reset()
+					committed = true
+				}
+			} else {
+				if firstTokenMS == 0 && hasOutput {
+					firstTokenMS = time.Since(started).Milliseconds()
+				}
+				if err := write(out); err != nil {
+					return usage, firstTokenMS, committed, err
+				}
+				committed = true
+			}
+		}
+		if readErr == io.EOF {
+			if delayUntilFirstOutput && !committed {
+				return usage, firstTokenMS, false, fmt.Errorf("%w: %w", errUpstreamResponseRead, errUpstreamStreamEmpty)
+			}
+			if seenTerminalFailure {
+				return usage, firstTokenMS, committed, fmt.Errorf("responses upstream terminated with failure")
+			}
+			if delayUntilFirstOutput && !seenCompleted {
+				return usage, firstTokenMS, committed, fmt.Errorf("%w: responses stream ended without response.completed", errUpstreamResponseRead)
+			}
+			return usage, firstTokenMS, committed, nil
+		}
+		if readErr != nil {
+			if errors.Is(readErr, errUpstreamFirstOutputTimeout) {
+				return usage, firstTokenMS, committed, fmt.Errorf("%w: %w", errUpstreamResponseRead, readErr)
+			}
+			return usage, firstTokenMS, committed, fmt.Errorf("%w: %w", errUpstreamResponseRead, readErr)
+		}
+	}
+}
+
+func copyStreamResponse(w http.ResponseWriter, src io.Reader, started time.Time, delayUntilFirstOutput bool, path, model string, firstOutputTimeout time.Duration) (tokenUsage, int64, bool, error) {
+	if path == "/v1/responses" {
+		return copyResponsesStreamResponse(w, src, started, delayUntilFirstOutput, model, firstOutputTimeout)
+	}
 	reader := bufio.NewReaderSize(src, 32<<10)
 	flusher, _ := w.(http.Flusher)
 	var usage tokenUsage
 	var firstTokenMS int64
 	seenFinishReason := false
+	seenDone := false
+	seenResponsesCompleted := false
 	var pending strings.Builder
 	committed := false
+	responsesAPI := path == "/v1/responses"
+	pendingFunctionEventHeader := ""
+	var responses *responsesStreamState
+	if responsesAPI {
+		responses = newResponsesStreamState(model, started)
+	}
 	write := func(data string) error {
 		if _, writeErr := io.WriteString(w, data); writeErr != nil {
 			return fmt.Errorf("client response write: %w", writeErr)
@@ -1664,20 +2455,96 @@ func copyResponse(w http.ResponseWriter, src io.Reader, started time.Time, delay
 		}
 		return nil
 	}
+	readLine := func() (string, error) {
+		if !delayUntilFirstOutput || committed || firstOutputTimeout <= 0 {
+			return reader.ReadString('\n')
+		}
+		remaining := time.Until(started.Add(firstOutputTimeout))
+		if remaining <= 0 {
+			return "", errUpstreamFirstOutputTimeout
+		}
+		result := make(chan sseLineResult, 1)
+		go func() {
+			line, err := reader.ReadString('\n')
+			result <- sseLineResult{line: line, err: err}
+		}()
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case result := <-result:
+			return result.line, result.err
+		case <-timer.C:
+			return "", errUpstreamFirstOutputTimeout
+		}
+	}
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readLine()
+		// The terminal event header must travel with its reconstructed data
+		// payload. Forwarding the original header here would create two adjacent
+		// response.completed events when the next line is normalized below.
+		if responsesAPI && responsesEventName(line) == "response.completed" {
+			continue
+		}
+		if responsesAPI && responsesEventName(line) == "response.function_call_arguments.delta" {
+			// Hold this header until its data line identifies the output item. The
+			// injected output_item.added event must precede both lines as one SSE
+			// event, otherwise strict clients associate the added payload with this
+			// function-call header.
+			pendingFunctionEventHeader = line
+			continue
+		}
 		if len(line) > 0 {
+			chatDone := !responsesAPI && sseLineIsDone(line)
+			responsesHasOutput := false
+			if responsesAPI {
+				responsesHasOutput = sseLineHasOutputForPath(line, true)
+				if responsesLineIsCreated(line) {
+					responses.created = true
+					responses.observeCreated(line)
+				} else {
+					responses.observe(line)
+					var injected strings.Builder
+					if !responses.created && responsesLineNeedsCreated(line) {
+						injected.WriteString(responses.createdEvent())
+						responses.created = true
+					}
+					if responsesLineIsTextDelta(line) {
+						injected.WriteString(responses.ensureTextLifecycle())
+						line = responses.normalizeTextDelta(line)
+					}
+					if responsesLineIsFunctionCallDelta(line) && strings.HasPrefix(strings.TrimSpace(line), "data:") {
+						injected.WriteString(responses.ensureOutputLifecycle())
+						if pendingFunctionEventHeader != "" {
+							injected.WriteString(pendingFunctionEventHeader)
+							pendingFunctionEventHeader = ""
+						}
+					}
+					if responsesLineIsCompleted(line) {
+						seenResponsesCompleted = true
+						usage = mergeTokenUsage(usage, parseSSETokenUsage(line))
+						injected.WriteString(responses.completionEvents())
+						line = responses.completedEvent(usage)
+					}
+					line = injected.String() + line
+				}
+			}
 			usage = mergeTokenUsage(usage, parseSSETokenUsage(line))
-			hasOutput := sseLineHasOutput(line)
-			if sseLineHasFinishReason(line) {
+			hasOutput := sseLineHasOutputForPath(line, responsesAPI)
+			if responsesHasOutput {
+				hasOutput = true
+			}
+			if !responsesAPI && sseLineHasFinishReason(line) {
 				seenFinishReason = true
 			}
-			if sseLineIsDone(line) && !seenFinishReason {
+			if chatDone && !seenFinishReason {
 				// Some OpenAI-compatible upstreams emit [DONE] without a final
 				// choice carrying finish_reason. Preserve the declared completion
 				// while giving strict clients a standards-compatible terminal chunk.
 				line = `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" + line
 				seenFinishReason = true
+			}
+			if chatDone {
+				seenDone = true
 			}
 			if delayUntilFirstOutput && !committed {
 				pending.WriteString(line)
@@ -1703,9 +2570,18 @@ func copyResponse(w http.ResponseWriter, src io.Reader, started time.Time, delay
 			if delayUntilFirstOutput && !committed {
 				return usage, firstTokenMS, false, fmt.Errorf("%w: %w", errUpstreamResponseRead, errUpstreamStreamEmpty)
 			}
+			if delayUntilFirstOutput && responsesAPI && !seenResponsesCompleted {
+				return usage, firstTokenMS, committed, fmt.Errorf("%w: responses stream ended without response.completed", errUpstreamResponseRead)
+			}
+			if delayUntilFirstOutput && !responsesAPI && !seenDone {
+				return usage, firstTokenMS, committed, fmt.Errorf("%w: chat stream ended without [DONE]", errUpstreamResponseRead)
+			}
 			return usage, firstTokenMS, committed, nil
 		}
 		if err != nil {
+			if errors.Is(err, errUpstreamFirstOutputTimeout) {
+				return usage, firstTokenMS, committed, fmt.Errorf("%w: %w", errUpstreamResponseRead, err)
+			}
 			return usage, firstTokenMS, committed, fmt.Errorf("%w: %w", errUpstreamResponseRead, err)
 		}
 	}
@@ -1738,6 +2614,10 @@ func sseLineHasFinishReason(line string) bool {
 }
 
 func sseLineHasOutput(line string) bool {
+	return sseLineHasOutputForPath(line, false) || sseLineHasOutputForPath(line, true)
+}
+
+func sseLineHasOutputForPath(line string, responsesAPI bool) bool {
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "data:") {
 		return false
@@ -1747,19 +2627,27 @@ func sseLineHasOutput(line string) bool {
 		Delta   string `json:"delta"`
 		Choices []struct {
 			Delta struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+				Content          string          `json:"content"`
+				ReasoningContent string          `json:"reasoning_content"`
+				Reasoning        string          `json:"reasoning"`
+				ToolCalls        json.RawMessage `json:"tool_calls"`
+				FunctionCall     json.RawMessage `json:"function_call"`
 			} `json:"delta"`
 		} `json:"choices"`
 	}
 	if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &payload) != nil {
 		return false
 	}
-	if payload.Type == "response.output_text.delta" && payload.Delta != "" {
-		return true
+	if responsesAPI {
+		switch payload.Type {
+		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.function_call_arguments.delta":
+			return payload.Delta != ""
+		case "response.output_item.added", "response.content_part.added", "response.function_call_arguments.done", "response.output_text.done", "response.completed", "response.failed", "response.incomplete":
+			return true
+		}
 	}
 	for _, choice := range payload.Choices {
-		if choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" {
+		if choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" || choice.Delta.Reasoning != "" || len(choice.Delta.ToolCalls) > 0 || len(choice.Delta.FunctionCall) > 0 {
 			return true
 		}
 	}

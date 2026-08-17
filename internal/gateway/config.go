@@ -35,6 +35,8 @@ type Config struct {
 	QueueSize                int
 	MaxRetries               int
 	RequestTimeout           time.Duration
+	StreamFirstOutputTimeout time.Duration
+	StreamFailureCooldown    time.Duration
 	CooldownBase             time.Duration
 	CooldownMax              time.Duration
 	OpenCodeClient           string
@@ -52,8 +54,8 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		ListenAddr: "0.0.0.0:13339", UpstreamURL: "https://opencode.ai/zen",
-		MaxConcurrency: 4, QueueSize: 16, MaxRetries: 1,
-		RequestTimeout: 5 * time.Minute, CooldownBase: 5 * time.Second,
+		MaxConcurrency: 4, QueueSize: 16, MaxRetries: 2,
+		RequestTimeout: 5 * time.Minute, StreamFirstOutputTimeout: 20 * time.Second, StreamFailureCooldown: 10 * time.Minute, CooldownBase: 5 * time.Second,
 		CooldownMax: 60 * time.Second, ProxyRefresh: 30 * time.Second,
 		ProxyProbeURLs: []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://www.cloudflare.com/cdn-cgi/trace"}, ProxyProbeWait: 10 * time.Second,
 		ProxyProbeJobs: 8, DirectEnabled: true,
@@ -123,6 +125,20 @@ func LoadConfig() (Config, error) {
 			return c, fmt.Errorf("REQUEST_TIMEOUT: %w", err)
 		}
 		c.RequestTimeout = d
+	}
+	if v := os.Getenv("STREAM_FIRST_OUTPUT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return c, fmt.Errorf("STREAM_FIRST_OUTPUT_TIMEOUT must be a non-negative duration")
+		}
+		c.StreamFirstOutputTimeout = d
+	}
+	if v := os.Getenv("STREAM_FAILURE_COOLDOWN"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return c, fmt.Errorf("STREAM_FAILURE_COOLDOWN must be a non-negative duration")
+		}
+		c.StreamFailureCooldown = d
 	}
 	if v := os.Getenv("COOLDOWN_BASE"); v != "" {
 		d, err := time.ParseDuration(v)

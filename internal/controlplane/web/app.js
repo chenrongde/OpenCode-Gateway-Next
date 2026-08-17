@@ -1,4 +1,4 @@
-const APP_VERSION = '1.0.10';
+const APP_VERSION = '1.0.16';
 const RELEASE_REPO = 'choateyang/OpenCode-Gateway-Next';
 const token = sessionStorage.getItem('control-token') || prompt('输入 ADMIN_TOKEN');
 if (token) sessionStorage.setItem('control-token', token);
@@ -200,6 +200,11 @@ function renderLogs() {
 
 const formatNumber = value => new Intl.NumberFormat('zh-CN').format(Number(value) || 0);
 const formatUSD = value => `$${(Number(value) || 0).toFixed(6)}`;
+const cacheHitRate = (cachedTokens, promptTokens) => {
+  const input = Number(promptTokens) || 0;
+  if (input <= 0) return '-';
+  return `${Math.min(100, Math.max(0, ((Number(cachedTokens) || 0) / input) * 100)).toFixed(1)}%`;
+};
 
 function outputSpeed(record) {
   if (!record.stream || !Number(record.completion_tokens) || !Number(record.first_token_ms)) return '';
@@ -244,20 +249,24 @@ function renderTokens(data) {
   const summary = data.summary || {};
   const records = data.records || [];
   syncTokenFilters(records);
+	const instanceView = Boolean($('tokenInstance').value);
+	$('tokenSummary').classList.toggle('instance-view', instanceView);
+	document.querySelectorAll('[data-token-detail]').forEach(card => { card.hidden = instanceView; });
   $('tokenRequests').textContent = formatNumber(summary.requests);
   $('tokenSuccess').textContent = `成功 ${formatNumber(summary.success)} · 异常 ${formatNumber(summary.errors)}`;
   $('tokenTotal').textContent = formatNumber(summary.total_tokens);
   $('tokenPrompt').textContent = formatNumber(summary.prompt_tokens);
   $('tokenCompletion').textContent = formatNumber(summary.completion_tokens);
   $('tokenCached').textContent = formatNumber(summary.cached_tokens);
+	$('tokenCacheRate').textContent = cacheHitRate(summary.cached_tokens, summary.prompt_tokens);
   $('tokenCost').textContent = formatUSD(summary.total_cost_usd);
   $('tokenRows').innerHTML = records.map(record => {
     const success = Number(record.status) >= 200 && Number(record.status) < 400;
-    const hasUsage = Number(record.total_tokens) || Number(record.prompt_tokens) || Number(record.completion_tokens);
+    const hasUsage = Number(record.total_tokens) || Number(record.prompt_tokens) || Number(record.completion_tokens) || Number(record.cached_tokens);
     const speed = outputSpeed(record);
     const firstToken = Number(record.first_token_ms) ? `${(Number(record.first_token_ms) / 1000).toFixed(1)}s` : '-';
     const recovered = record.recovered ? ' · 已恢复' : '';
-    return `<tr><td><time>${esc(displayTime(record.at))}</time><small>${esc(new Date(record.at).toLocaleDateString('zh-CN'))}</small></td><td><strong>${esc(record.instance || '-')}</strong><small class="mono">${esc(record.egress || '出口未知')}</small></td><td><code class="path-chip">${esc(record.path || '-')}</code></td><td><code class="key-chip">${esc(record.client_key || '旧记录')}</code></td><td><span class="model-chip" title="${esc(record.model || '')}">${esc(record.model || '-')}</span></td><td><span class="stream-state ${record.stream ? 'streaming' : ''}">${record.stream ? '流' : '非流'}</span><small>${speed || '-'}</small></td><td class="usage-cell">${hasUsage ? `<strong>${formatNumber(record.prompt_tokens)} / ${formatNumber(record.completion_tokens)}</strong><small>总计 ${formatNumber(record.total_tokens)}${Number(record.cached_tokens) ? ` · 缓存 ${formatNumber(record.cached_tokens)}` : ''}</small>` : '<span class="muted">未返回用量</span>'}</td><td>${costDetails(record)}</td><td><span class="status-chip ${success ? 'ok' : 'bad'}">${Number(record.status) || '-'}</span><small>${esc(record.source || 'upstream')}${recovered}</small></td><td class="latency-cell"><i class="${success ? 'ok' : 'bad'}"></i><strong>首字 ${firstToken}</strong><small>耗时 ${(Number(record.latency_ms) / 1000).toFixed(1)}s · 第${Number(record.attempts) || 1}次</small></td></tr>`;
+    return `<tr><td><time>${esc(displayTime(record.at))}</time><small>${esc(new Date(record.at).toLocaleDateString('zh-CN'))}</small></td><td><strong>${esc(record.instance || '-')}</strong><small class="mono">${esc(record.egress || '出口未知')}</small></td><td><code class="path-chip">${esc(record.path || '-')}</code></td><td><code class="key-chip">${esc(record.client_key || '旧记录')}</code></td><td><span class="model-chip" title="${esc(record.model || '')}">${esc(record.model || '-')}</span></td><td><span class="stream-state ${record.stream ? 'streaming' : ''}">${record.stream ? '流' : '非流'}</span><small>${speed || '-'}</small></td><td class="usage-cell">${hasUsage ? `<strong>输入 ${formatNumber(record.prompt_tokens)} / 输出 ${formatNumber(record.completion_tokens)}</strong><small>${Number(record.cached_tokens) ? `缓存 ${formatNumber(record.cached_tokens)}` : '未命中缓存'}</small>` : '<span class="muted">未返回用量</span>'}</td><td>${costDetails(record)}</td><td><span class="status-chip ${success ? 'ok' : 'bad'}">${Number(record.status) || '-'}</span><small>${esc(record.source || 'upstream')}${recovered}</small></td><td class="latency-cell"><i class="${success ? 'ok' : 'bad'}"></i><strong>首字 ${firstToken}</strong><small>耗时 ${(Number(record.latency_ms) / 1000).toFixed(1)}s · 第${Number(record.attempts) || 1}次</small></td></tr>`;
   }).join('') || '<tr><td colspan="10"><p class="empty-state">当前筛选条件下暂无接口统计记录</p></td></tr>';
 }
 
