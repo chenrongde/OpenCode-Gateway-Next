@@ -1,10 +1,10 @@
 package main
 
 import (
+	"dualroute-gateway/internal/controlplane"
 	"errors"
 	"log/slog"
 	"net/http"
-	"opencode-gateway-next/internal/controlplane"
 	"os"
 	"time"
 )

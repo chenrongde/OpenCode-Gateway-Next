@@ -11,6 +11,14 @@ import (
 )
 
 const (
+	ProviderTokenRouter = "tokenrouter"
+	ProviderOpenCode    = "opencode"
+
+	tokenRouterURL   = "https://api.tokenrouter.com/v1"
+	openCodeZenURL   = "https://opencode.ai/zen"
+	tokenRouterModel = "deepseek/deepseek-v4-pro-0813-free"
+	openCodeModel    = "deepseek-v4-flash-free"
+
 	opencodeVersion   = "1.18.16"
 	opencodeUserAgent = "opencode/" + opencodeVersion
 	opencodeClient    = "cli"
@@ -20,8 +28,10 @@ const (
 
 type Config struct {
 	ListenAddr               string
+	UpstreamProvider         string
 	UpstreamURL              string
-	OpenCodeAPIKey           string
+	UpstreamAPIKey           string
+	ForcedModel              string
 	GatewayKeys              []string
 	ProxyURLs                []string
 	ProxyListFile            string
@@ -39,10 +49,6 @@ type Config struct {
 	StreamFailureCooldown    time.Duration
 	CooldownBase             time.Duration
 	CooldownMax              time.Duration
-	OpenCodeClient           string
-	OpenCodeVersion          string
-	OpenCodeReferer          string
-	OpenCodeTitle            string
 	FreeModelsOnly           bool
 	DisableThinkingByDefault bool
 	MinThinkingMaxTokens     int
@@ -53,13 +59,13 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr: "0.0.0.0:13339", UpstreamURL: "https://opencode.ai/zen",
+		ListenAddr: "0.0.0.0:13339", UpstreamProvider: ProviderTokenRouter, UpstreamURL: tokenRouterURL, ForcedModel: tokenRouterModel,
 		MaxConcurrency: 4, QueueSize: 16, MaxRetries: 2,
 		RequestTimeout: 5 * time.Minute, StreamFirstOutputTimeout: 20 * time.Second, StreamFailureCooldown: 10 * time.Minute, CooldownBase: 5 * time.Second,
 		CooldownMax: 60 * time.Second, ProxyRefresh: 30 * time.Second,
 		ProxyProbeURLs: []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://www.cloudflare.com/cdn-cgi/trace"}, ProxyProbeWait: 10 * time.Second,
 		ProxyProbeJobs: 8, DirectEnabled: true,
-		OpenCodeClient: opencodeClient, OpenCodeVersion: opencodeVersion, OpenCodeReferer: opencodeReferer, OpenCodeTitle: opencodeTitle, FreeModelsOnly: true, DisableThinkingByDefault: true, MinThinkingMaxTokens: 8192,
+		FreeModelsOnly: false, DisableThinkingByDefault: false, MinThinkingMaxTokens: 0,
 		DataDir: "/data",
 	}
 }
@@ -69,10 +75,16 @@ func LoadConfig() (Config, error) {
 	if v := os.Getenv("LISTEN_ADDR"); v != "" {
 		c.ListenAddr = v
 	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("UPSTREAM_PROVIDER"))); v != "" {
+		c.UpstreamProvider = v
+	}
+	if err := applyProviderDefaults(&c); err != nil {
+		return c, err
+	}
 	if v := os.Getenv("UPSTREAM_URL"); v != "" {
 		c.UpstreamURL = strings.TrimRight(v, "/")
 	}
-	c.OpenCodeAPIKey = strings.TrimSpace(os.Getenv("OPENCODE_API_KEY"))
+	c.UpstreamAPIKey = strings.TrimSpace(os.Getenv("UPSTREAM_API_KEY"))
 	if v := os.Getenv("GATEWAY_KEYS"); v != "" {
 		c.GatewayKeys = split(v)
 	}
@@ -154,18 +166,6 @@ func LoadConfig() (Config, error) {
 		}
 		c.CooldownMax = d
 	}
-	if v := strings.TrimSpace(os.Getenv("OPENCODE_CLIENT")); v != "" {
-		c.OpenCodeClient = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OPENCODE_VERSION")); v != "" {
-		c.OpenCodeVersion = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OPENCODE_REFERER")); v != "" {
-		c.OpenCodeReferer = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OPENCODE_TITLE")); v != "" {
-		c.OpenCodeTitle = v
-	}
 	if v := os.Getenv("FREE_MODELS_ONLY"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -197,19 +197,11 @@ func LoadConfig() (Config, error) {
 	if u, err := url.Parse(c.UpstreamURL); err != nil || u.Scheme == "" || u.Host == "" {
 		return c, fmt.Errorf("UPSTREAM_URL must be an absolute URL")
 	}
-	if len(c.GatewayKeys) == 0 {
-		return c, fmt.Errorf("GATEWAY_KEYS is required")
+	if c.UpstreamAPIKey == "" {
+		return c, fmt.Errorf("UPSTREAM_API_KEY is required")
 	}
-	if c.OpenCodeAPIKey == "" {
-		return c, fmt.Errorf("OPENCODE_API_KEY is required")
-	}
-	for name, value := range map[string]string{"OPENCODE_CLIENT": c.OpenCodeClient, "OPENCODE_VERSION": c.OpenCodeVersion, "OPENCODE_REFERER": c.OpenCodeReferer, "OPENCODE_TITLE": c.OpenCodeTitle} {
-		if value == "" || strings.IndexFunc(value, unicode.IsControl) >= 0 {
-			return c, fmt.Errorf("%s is invalid", name)
-		}
-	}
-	if len(c.OpenCodeAPIKey) > 512 || strings.IndexFunc(c.OpenCodeAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-		return c, fmt.Errorf("OPENCODE_API_KEY is invalid")
+	if len(c.UpstreamAPIKey) > 512 || strings.IndexFunc(c.UpstreamAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return c, fmt.Errorf("UPSTREAM_API_KEY is invalid")
 	}
 	if c.MaxConcurrency < 1 || c.QueueSize < 0 || c.MaxRetries < 0 || c.MinThinkingMaxTokens < 0 || c.CooldownBase <= 0 || c.CooldownMax < c.CooldownBase {
 		return c, fmt.Errorf("invalid concurrency/retry/cooldown settings")
@@ -229,6 +221,26 @@ func LoadConfig() (Config, error) {
 		return c, fmt.Errorf("at least one proxy source is required when DIRECT_ENABLED=false")
 	}
 	return c, nil
+}
+
+func applyProviderDefaults(c *Config) error {
+	switch c.UpstreamProvider {
+	case ProviderTokenRouter:
+		c.UpstreamURL = tokenRouterURL
+		c.ForcedModel = tokenRouterModel
+		c.FreeModelsOnly = false
+		c.DisableThinkingByDefault = false
+		c.MinThinkingMaxTokens = 0
+	case ProviderOpenCode:
+		c.UpstreamURL = openCodeZenURL
+		c.ForcedModel = openCodeModel
+		c.FreeModelsOnly = true
+		c.DisableThinkingByDefault = true
+		c.MinThinkingMaxTokens = 8192
+	default:
+		return fmt.Errorf("UPSTREAM_PROVIDER must be %q or %q", ProviderTokenRouter, ProviderOpenCode)
+	}
+	return nil
 }
 
 func split(v string) []string {

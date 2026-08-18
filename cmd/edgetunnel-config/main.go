@@ -1,8 +1,8 @@
 package main
 
 import (
+	"dualroute-gateway/internal/edgetunnel"
 	"log"
-	"opencode-gateway-next/internal/edgetunnel"
 	"os"
 	"strconv"
 )

@@ -12,8 +12,8 @@ import (
 )
 
 func TestAPIHandlerReturnsUnavailableWithoutRunningInstances(t *testing.T) {
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
-	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4-pro-0813-free"}`))
 	request.Header.Set("Authorization", "Bearer gateway-key")
 	response := httptest.NewRecorder()
 	s.APIHandler().ServeHTTP(response, request)
@@ -35,7 +35,7 @@ func TestAPIHandlerProxiesPathQueryHeadersAndResponse(t *testing.T) {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
 		body, _ := io.ReadAll(r.Body)
-		if string(body) != `{"model":"deepseek-v4-flash-free"}` {
+		if string(body) != `{"model":"deepseek/deepseek-v4-pro-0813-free"}` {
 			t.Errorf("body = %s", body)
 		}
 		w.Header().Set("X-Upstream", "gateway-a")
@@ -43,9 +43,9 @@ func TestAPIHandlerProxiesPathQueryHeadersAndResponse(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":"limited"}`)
 	}))
 	defer upstream.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
 	s.instances = []Instance{{Name: "gateway-a", URL: upstream.URL, Status: "running"}}
-	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?trace=1", strings.NewReader(`{"model":"deepseek-v4-flash-free"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?trace=1", strings.NewReader(`{"model":"deepseek/deepseek-v4-pro-0813-free"}`))
 	request.Header.Set("Authorization", "Bearer gateway-key")
 	response := httptest.NewRecorder()
 	s.APIHandler().ServeHTTP(response, request)
@@ -74,13 +74,13 @@ func TestAPIHandlerUsesProxyTrafficPool(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer proxy.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: false, BootstrapKeys: []string{"gateway-key"}})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: false, BootstrapKeys: []string{"gateway-key"}})
 	s.instances = []Instance{
 		{Name: "gateway-a", URL: direct.URL, Status: "running"},
 		{Name: "gateway-b", URL: proxy.URL, Status: "running", ProxyURLs: []string{"socks5h://mihomo:10801"}},
 	}
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4-pro-0813-free"}`))
 	request.Header.Set("Authorization", "Bearer gateway-key")
 	s.APIHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || directCalls != 0 || proxyCalls != 1 {
@@ -89,9 +89,9 @@ func TestAPIHandlerUsesProxyTrafficPool(t *testing.T) {
 }
 
 func TestAPIHandlerReturnsServiceUnavailableWithoutInstances(t *testing.T) {
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4-pro-0813-free"}`))
 	request.Header.Set("Authorization", "Bearer gateway-key")
 	s.APIHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "no_healthy_gateway_instances") {
@@ -100,7 +100,7 @@ func TestAPIHandlerReturnsServiceUnavailableWithoutInstances(t *testing.T) {
 }
 
 func TestAPIHandlerRejectsUnknownKey(t *testing.T) {
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
 	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	request.Header.Set("Authorization", "Bearer wrong-key")
 	response := httptest.NewRecorder()
@@ -111,7 +111,7 @@ func TestAPIHandlerRejectsUnknownKey(t *testing.T) {
 }
 
 func TestAPIHandlerRejectsZenKeyAsClientCredential(t *testing.T) {
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
 	s.zenKeys["gateway-a"] = "zen-secret-key"
 	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	request.Header.Set("Authorization", "Bearer zen-secret-key")
@@ -122,13 +122,82 @@ func TestAPIHandlerRejectsZenKeyAsClientCredential(t *testing.T) {
 	}
 }
 
+func TestAPIHandlerRoutesSharedGatewayKeyByRequestedModel(t *testing.T) {
+	var tokenRouterCalls, openCodeCalls atomic.Int32
+	tokenRouter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		tokenRouterCalls.Add(1)
+		_, _ = io.WriteString(w, "tokenrouter")
+	}))
+	defer tokenRouter.Close()
+	openCode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		openCodeCalls.Add(1)
+		_, _ = io.WriteString(w, "opencode")
+	}))
+	defer openCode.Close()
+
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
+	s.keys = []string{"shared-key"}
+	s.instances = []Instance{{Name: "tokenrouter", URL: tokenRouter.URL, Status: "running", Provider: ProviderTokenRouter}, {Name: "opencode", URL: openCode.URL, Status: "running", Provider: ProviderOpenCode}}
+	for model, expected := range map[string]string{tokenRouterModel: "tokenrouter", openCodeModel: "opencode"} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+model+`"}`))
+		request.Header.Set("Authorization", "Bearer shared-key")
+		response := httptest.NewRecorder()
+		s.APIHandler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Body.String() != expected {
+			t.Fatalf("model %s: status=%d body=%q", model, response.Code, response.Body.String())
+		}
+	}
+	if tokenRouterCalls.Load() != 1 || openCodeCalls.Load() != 1 {
+		t.Fatalf("calls tokenrouter=%d opencode=%d", tokenRouterCalls.Load(), openCodeCalls.Load())
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer shared-key")
+	response := httptest.NewRecorder()
+	s.APIHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), tokenRouterModel) || !strings.Contains(response.Body.String(), openCodeModel) {
+		t.Fatalf("models response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestDefaultLoginRequiresPasswordChange(t *testing.T) {
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
+	login := httptest.NewRecorder()
+	s.Handler().ServeHTTP(login, httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"admin","password":"admin"}`)))
+	if login.Code != http.StatusOK || !strings.Contains(login.Body.String(), `"must_change_password":true`) || len(login.Result().Cookies()) != 1 {
+		t.Fatalf("login = %d %s", login.Code, login.Body.String())
+	}
+	cookie := login.Result().Cookies()[0]
+	blocked := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/keys", nil)
+	req.AddCookie(cookie)
+	s.Handler().ServeHTTP(blocked, req)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("keys before password change = %d", blocked.Code)
+	}
+	changed := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/auth/password", strings.NewReader(`{"password":"a-new-password"}`))
+	req.AddCookie(cookie)
+	s.Handler().ServeHTTP(changed, req)
+	if changed.Code != http.StatusOK {
+		t.Fatalf("password change = %d %s", changed.Code, changed.Body.String())
+	}
+}
+
 func TestZenKeysPersistReloadAndMask(t *testing.T) {
 	dataDir := t.TempDir()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: dataDir})
+	s := New(Config{InstanceToken: "internal", DataDir: dataDir})
 	s.zenKeys["gateway-a"] = "zen-instance-secret-key"
 	s.persistZenKeysLocked()
 
-	reloaded := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: dataDir})
+	reloaded := New(Config{InstanceToken: "internal", DataDir: dataDir})
 	if reloaded.zenKeys["gateway-a"] != "zen-instance-secret-key" {
 		t.Fatalf("reloaded keys = %#v", reloaded.zenKeys)
 	}
@@ -145,7 +214,7 @@ func TestZenKeysPersistReloadAndMask(t *testing.T) {
 }
 
 func TestAcquireAPIInstanceUsesLeastConnectionsAndRoundRobinTies(t *testing.T) {
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	instances := []Instance{{Name: "gateway-a"}, {Name: "gateway-b"}}
 	s.apiInflight["gateway-a"] = 2
 	if got := s.acquireAPIInstance(instances); got.Name != "gateway-b" {
@@ -160,7 +229,7 @@ func TestAcquireAPIInstanceUsesLeastConnectionsAndRoundRobinTies(t *testing.T) {
 }
 
 func TestAcquireAPIInstanceSkipsTemporarilyFailedInstance(t *testing.T) {
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	s.apiCircuits["gateway-a"] = apiCircuit{Failures: 1, Until: time.Now().Add(time.Minute)}
 	instances := []Instance{{Name: "gateway-a"}, {Name: "gateway-b"}}
 	if got := s.acquireAPIInstance(instances); got.Name != "gateway-b" {
@@ -188,11 +257,11 @@ func TestAPIHandlerTemporarilySkipsGatewayAfter5xx(t *testing.T) {
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer healthy.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: true, BootstrapKeys: []string{"gateway-key"}})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: true, BootstrapKeys: []string{"gateway-key"}})
 	s.instances = []Instance{{Name: "gateway-a", URL: failed.URL, Status: "running"}, {Name: "gateway-b", URL: healthy.URL, Status: "running"}}
 	request := func() *httptest.ResponseRecorder {
 		response := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4-pro-0813-free"}`))
 		req.Header.Set("Authorization", "Bearer gateway-key")
 		s.APIHandler().ServeHTTP(response, req)
 		return response
@@ -229,9 +298,9 @@ func TestAPIHandlerSkipsUnhealthyInstanceBeforeFirstRequest(t *testing.T) {
 	}))
 	defer healthy.Close()
 
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: true, BootstrapKeys: []string{"gateway-key"}})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), DirectFallback: true, BootstrapKeys: []string{"gateway-key"}})
 	s.instances = []Instance{{Name: "gateway-starting", URL: unhealthy.URL, Status: "running"}, {Name: "gateway-ready", URL: healthy.URL, Status: "running"}}
-	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4-pro-0813-free"}`))
 	request.Header.Set("Authorization", "Bearer gateway-key")
 	response := httptest.NewRecorder()
 	s.APIHandler().ServeHTTP(response, request)
@@ -268,7 +337,7 @@ func TestReadyTrafficPoolProbesInstancesConcurrently(t *testing.T) {
 		}
 	}()
 
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	instances := make([]Instance, 0, len(servers))
 	for index, server := range servers {
 		instances = append(instances, Instance{Name: "gateway-" + string(rune('a'+index)), URL: server.URL, Status: "running"})
@@ -291,18 +360,20 @@ func TestControlPagesAndTokenStats(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	s.instances = []Instance{{Name: "gateway-a", URL: upstream.URL, Status: "running"}}
-	for _, path := range []string{"/", "/instances", "/mihomo", "/keys", "/logs", "/tokens"} {
+	s.auth.MustChangePassword = false
+	s.sessions["test-session"] = session{ExpiresAt: time.Now().Add(time.Hour)}
+	for path, page := range map[string]string{"/": "instances", "/instances": "instances", "/mihomo": "mihomo", "/keys": "keys", "/logs": "logs", "/tokens": "tokens"} {
 		response := httptest.NewRecorder()
 		s.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "OpenCode Gateway Next") {
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "DualRoute Gateway") || !strings.Contains(response.Body.String(), `data-page="`+page+`"`) {
 			t.Fatalf("page %s: status=%d body=%s", path, response.Code, response.Body.String())
 		}
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/api/tokens", nil)
-	request.Header.Set("Authorization", "Bearer admin")
+	request.AddCookie(&http.Cookie{Name: authCookieName, Value: "test-session"})
 	response := httptest.NewRecorder()
 	s.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -326,7 +397,7 @@ func TestControlPagesAndTokenStats(t *testing.T) {
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "/api/tokens?path=%2Fv1%2Fresponses", nil)
-	request.Header.Set("Authorization", "Bearer admin")
+	request.AddCookie(&http.Cookie{Name: authCookieName, Value: "test-session"})
 	response = httptest.NewRecorder()
 	s.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {

@@ -1,6 +1,6 @@
 services:
   control-plane:
-    image: opencode-gateway-next-gateway:latest
+    image: dualroute-gateway-gateway:latest
     build:
       context: .
       dockerfile: ${GATEWAY_DOCKERFILE:-Dockerfile}
@@ -11,14 +11,11 @@ services:
     environment:
       CONTROL_LISTEN_ADDR: 0.0.0.0:13338
       API_LISTEN_ADDR: 0.0.0.0:13337
-      ADMIN_TOKEN: ${ADMIN_TOKEN}
-      INSTANCE_ADMIN_TOKEN: ${INSTANCE_ADMIN_TOKEN:-${ADMIN_TOKEN}}
-      GATEWAY_KEYS: ${GATEWAY_KEYS}
       CONTROL_DATA_DIR: /control-data
-      GATEWAY_IMAGE: ${GATEWAY_IMAGE:-opencode-gateway-next-gateway:latest}
-      GATEWAY_NETWORK: ${GATEWAY_NETWORK:-opencode-gateway-network}
+      GATEWAY_IMAGE: ${GATEWAY_IMAGE:-dualroute-gateway-gateway:latest}
+      GATEWAY_NETWORK: ${GATEWAY_NETWORK:-dualroute-gateway-network}
       DIRECT_FALLBACK: ${DIRECT_FALLBACK:-${NGINX_DIRECT_FALLBACK:-false}}
-      MIHOMO_CONTAINER: opencode-gateway-mihomo
+      MIHOMO_CONTAINER: dualroute-gateway-mihomo
       MIHOMO_CONFIG_DIR: /mihomo-config
       MIHOMO_API_URL: http://mihomo:9090
       MIHOMO_MAX_SLOTS: ${MIHOMO_MAX_SLOTS:-64}
@@ -37,7 +34,7 @@ services:
 
   mihomo:
     image: metacubex/mihomo:v1.19.29
-    container_name: opencode-gateway-mihomo
+    container_name: dualroute-gateway-mihomo
     restart: unless-stopped
     command: ["-d", "/etc/mihomo", "-f", "/etc/mihomo/config.yaml"]
     volumes:
@@ -46,4 +43,4 @@ services:
 
 networks:
   default:
-    name: opencode-gateway-network
+    name: dualroute-gateway-network

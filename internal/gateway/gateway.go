@@ -750,7 +750,7 @@ func (g *Gateway) admin(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Keys []string `json:"keys"`
 		}
-		if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body) != nil || len(body.Keys) == 0 {
+		if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body) != nil {
 			http.Error(w, `{"error":"invalid_keys"}`, http.StatusBadRequest)
 			return
 		}
@@ -759,10 +759,6 @@ func (g *Gateway) admin(w http.ResponseWriter, r *http.Request) {
 			if key = strings.TrimSpace(key); key != "" {
 				replacement[key] = struct{}{}
 			}
-		}
-		if len(replacement) == 0 {
-			http.Error(w, `{"error":"at_least_one_key_required"}`, http.StatusBadRequest)
-			return
 		}
 		g.keyMu.Lock()
 		g.keys = replacement
@@ -1160,15 +1156,11 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, meta))
 	w.Header().Set("X-Gateway-Request-ID", gatewayRequestID)
 	baseResponseHeaders := w.Header().Clone()
-	target := strings.TrimRight(g.cfg.UpstreamURL, "/") + path
+	target := upstreamTargetURL(g.cfg.UpstreamURL, path)
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 	tried := make(map[string]struct{})
-	upstreamRequestID := strings.TrimSpace(r.Header.Get("X-OpenCode-Request"))
-	if upstreamRequestID == "" {
-		upstreamRequestID = gatewayRequestID
-	}
 	for attempt := 0; attempt <= g.cfg.MaxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1188,32 +1180,22 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return err
 		}
 		copyHeaders(req.Header, r.Header)
-		req.Header.Set("Authorization", "Bearer "+g.cfg.OpenCodeAPIKey)
-		version := g.cfg.OpenCodeVersion
-		if version == "" {
-			version = opencodeVersion
-		}
-		referer := g.cfg.OpenCodeReferer
-		if referer == "" {
-			referer = opencodeReferer
-		}
-		title := g.cfg.OpenCodeTitle
-		if title == "" {
-			title = opencodeTitle
-		}
-		req.Header.Set("User-Agent", "opencode/"+version)
-		req.Header.Set("HTTP-Referer", referer)
-		req.Header.Set("X-Title", title)
+		req.Header.Set("Authorization", "Bearer "+g.cfg.UpstreamAPIKey)
 		// The gateway can add SSE lifecycle events, so it must receive a body it
 		// can forward or transform without preserving a stale encoded length.
 		req.Header.Set("Accept-Encoding", "identity")
-		client := g.cfg.OpenCodeClient
-		if client == "" {
-			client = opencodeClient
-		}
-		req.Header.Set("X-OpenCode-Client", client)
-		if req.Header.Get("X-OpenCode-Request") == "" {
-			req.Header.Set("X-OpenCode-Request", upstreamRequestID)
+		if g.cfg.UpstreamProvider == ProviderOpenCode {
+			req.Header.Set("User-Agent", opencodeUserAgent)
+			req.Header.Set("HTTP-Referer", opencodeReferer)
+			req.Header.Set("X-Title", opencodeTitle)
+			req.Header.Set("X-OpenCode-Client", opencodeClient)
+			if req.Header.Get("X-OpenCode-Request") == "" {
+				req.Header.Set("X-OpenCode-Request", gatewayRequestID)
+			}
+		} else {
+			for _, header := range []string{"HTTP-Referer", "X-Title", "X-OpenCode-Client", "X-OpenCode-Request"} {
+				req.Header.Del(header)
+			}
 		}
 		req.Header.Del("Host")
 		req.Host = ""
@@ -1322,6 +1304,14 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	return nil
 }
 
+func upstreamTargetURL(baseURL, requestPath string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(baseURL, "/v1") && strings.HasPrefix(requestPath, "/v1/") {
+		return baseURL + strings.TrimPrefix(requestPath, "/v1")
+	}
+	return baseURL + requestPath
+}
+
 // normalizeRequestBody is retained for focused compatibility tests. The
 // forwarding path uses normalizeRequestBodyChecked so unsupported native
 // Responses input is rejected instead of silently changing its meaning.
@@ -1340,7 +1330,12 @@ func (g *Gateway) normalizeRequestBodyChecked(path string, body []byte) ([]byte,
 	}
 	changed := false
 	model, _ := payload["model"].(string)
-	if path == "/v1/responses" {
+	if g.cfg.ForcedModel != "" && model != g.cfg.ForcedModel {
+		model = g.cfg.ForcedModel
+		payload["model"] = model
+		changed = true
+	}
+	if g.cfg.UpstreamProvider == ProviderOpenCode && path == "/v1/responses" {
 		converted, err := normalizeResponsesInput(payload)
 		if err != nil {
 			return body, err

@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const managedLabel = "opencode.gateway.managed"
+const managedLabel = "dualroute.gateway.managed"
 
 var errContainerNotFound = errors.New("container not found")
 
@@ -205,11 +205,14 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, zenA
 	if !instanceNamePattern.MatchString(instance.Name) {
 		return fmt.Errorf("instance name must match %s", instanceNamePattern.String())
 	}
+	instance.Provider = providerOrDefault(instance.Provider)
 	direct := len(instance.ProxyURLs) == 0
 	environment := []string{
 		"LISTEN_ADDR=0.0.0.0:13339",
-		"UPSTREAM_URL=" + defaultUpstreamURL,
-		"OPENCODE_API_KEY=" + zenAPIKey,
+		"UPSTREAM_URL=" + upstreamURLForProvider(instance.Provider),
+		"UPSTREAM_PROVIDER=" + instance.Provider,
+		"UPSTREAM_MODEL=" + upstreamModelForProvider(instance.Provider),
+		"UPSTREAM_API_KEY=" + zenAPIKey,
 		"GATEWAY_KEYS=" + strings.Join(keys, ","),
 		"INSTANCE_ADMIN_TOKEN=" + cfg.InstanceToken,
 		"PROXY_URLS=" + strings.Join(instance.ProxyURLs, ","),
@@ -227,20 +230,17 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, zenA
 		"PROXY_PROBE_TIMEOUT=" + env("PROXY_PROBE_TIMEOUT", "10s"),
 		"PROXY_PROBE_CONCURRENCY=" + env("PROXY_PROBE_CONCURRENCY", "8"),
 		"TARGET_EGRESS_SLOTS=" + env("TARGET_EGRESS_SLOTS", "0"),
-		"OPENCODE_CLIENT=" + env("OPENCODE_CLIENT", "cli"),
-		"OPENCODE_VERSION=" + env("OPENCODE_VERSION", "1.18.16"),
-		"OPENCODE_REFERER=" + env("OPENCODE_REFERER", "https://opencode.ai/"),
-		"OPENCODE_TITLE=" + env("OPENCODE_TITLE", "opencode"),
-		"FREE_MODELS_ONLY=" + env("FREE_MODELS_ONLY", "true"),
-		"DISABLE_THINKING_BY_DEFAULT=" + env("DISABLE_THINKING_BY_DEFAULT", "true"),
-		"MIN_THINKING_MAX_TOKENS=" + env("MIN_THINKING_MAX_TOKENS", "8192"),
+		"FREE_MODELS_ONLY=" + strconv.FormatBool(instance.Provider == ProviderOpenCode),
+		"DISABLE_THINKING_BY_DEFAULT=" + strconv.FormatBool(instance.Provider == ProviderOpenCode),
+		"MIN_THINKING_MAX_TOKENS=" + providerThinkingTokenBudget(instance.Provider),
 	}
 	labels := map[string]string{
-		managedLabel:                       "true",
-		"opencode.gateway.name":            instance.Name,
-		"opencode.gateway.proxy_urls":      strings.Join(instance.ProxyURLs, ","),
-		"opencode.gateway.max_concurrency": strconv.Itoa(instance.MaxConcurrency),
-		"opencode.gateway.queue_size":      strconv.Itoa(instance.QueueSize),
+		managedLabel:                        "true",
+		"dualroute.gateway.name":            instance.Name,
+		"dualroute.gateway.proxy_urls":      strings.Join(instance.ProxyURLs, ","),
+		"dualroute.gateway.max_concurrency": strconv.Itoa(instance.MaxConcurrency),
+		"dualroute.gateway.queue_size":      strconv.Itoa(instance.QueueSize),
+		"dualroute.gateway.provider":        instance.Provider,
 	}
 	payload := map[string]any{
 		"Image":        cfg.GatewayImage,
@@ -301,7 +301,7 @@ func (d *dockerClient) removeDataVolume(name string) error {
 }
 
 func instanceDataVolume(name string) string {
-	return "opencode-gateway-data-" + name
+	return "dualroute-gateway-data-" + name
 }
 
 func (d *dockerClient) replace(cfg Config, instance Instance, keys []string, zenAPIKey string) error {
@@ -364,18 +364,21 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 	if !instanceNamePattern.MatchString(instance.Name) {
 		return fmt.Errorf("instance name must match %s", instanceNamePattern.String())
 	}
+	instance.Provider = providerOrDefault(instance.Provider)
 	direct := len(instance.ProxyURLs) == 0
 	overrides := map[string]string{
 		"LISTEN_ADDR": "0.0.0.0:13339", "GATEWAY_KEYS": strings.Join(keys, ","), "INSTANCE_ADMIN_TOKEN": cfg.InstanceToken,
-		"UPSTREAM_URL":     defaultUpstreamURL,
-		"OPENCODE_API_KEY": zenAPIKey,
-		"PROXY_URLS":       strings.Join(instance.ProxyURLs, ","), "DIRECT_ENABLED": strconv.FormatBool(direct),
+		"UPSTREAM_URL":      upstreamURLForProvider(instance.Provider),
+		"UPSTREAM_PROVIDER": instance.Provider,
+		"UPSTREAM_MODEL":    upstreamModelForProvider(instance.Provider),
+		"UPSTREAM_API_KEY":  zenAPIKey,
+		"PROXY_URLS":        strings.Join(instance.ProxyURLs, ","), "DIRECT_ENABLED": strconv.FormatBool(direct),
 		"MAX_CONCURRENCY": strconv.Itoa(instance.MaxConcurrency), "QUEUE_SIZE": strconv.Itoa(instance.QueueSize), "DATA_DIR": "/data",
 		"MAX_RETRIES": env("MAX_RETRIES", "2"), "REQUEST_TIMEOUT": env("REQUEST_TIMEOUT", "5m"), "STREAM_FIRST_OUTPUT_TIMEOUT": env("STREAM_FIRST_OUTPUT_TIMEOUT", "20s"), "STREAM_FAILURE_COOLDOWN": env("STREAM_FAILURE_COOLDOWN", "10m"),
 		"COOLDOWN_BASE": env("COOLDOWN_BASE", "5s"), "COOLDOWN_MAX": env("COOLDOWN_MAX", "60s"),
 		"PROXY_PROBE_URL": env("PROXY_PROBE_URL", "https://api.ipify.org,https://ifconfig.me/ip,https://www.cloudflare.com/cdn-cgi/trace"), "PROXY_PROBE_TIMEOUT": env("PROXY_PROBE_TIMEOUT", "10s"),
 		"PROXY_PROBE_CONCURRENCY": env("PROXY_PROBE_CONCURRENCY", "8"), "TARGET_EGRESS_SLOTS": env("TARGET_EGRESS_SLOTS", "0"),
-		"OPENCODE_CLIENT": env("OPENCODE_CLIENT", "cli"), "OPENCODE_VERSION": env("OPENCODE_VERSION", "1.18.16"), "OPENCODE_REFERER": env("OPENCODE_REFERER", "https://opencode.ai/"), "OPENCODE_TITLE": env("OPENCODE_TITLE", "opencode"), "FREE_MODELS_ONLY": env("FREE_MODELS_ONLY", "true"), "DISABLE_THINKING_BY_DEFAULT": env("DISABLE_THINKING_BY_DEFAULT", "true"), "MIN_THINKING_MAX_TOKENS": env("MIN_THINKING_MAX_TOKENS", "8192"),
+		"FREE_MODELS_ONLY": strconv.FormatBool(instance.Provider == ProviderOpenCode), "DISABLE_THINKING_BY_DEFAULT": strconv.FormatBool(instance.Provider == ProviderOpenCode), "MIN_THINKING_MAX_TOKENS": providerThinkingTokenBudget(instance.Provider),
 	}
 	environment := mergeEnvironment(original.Config.Env, overrides)
 	labels := map[string]string{}
@@ -383,11 +386,12 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 		labels[key] = value
 	}
 	labels[managedLabel] = "true"
-	labels["opencode.gateway.name"] = instance.Name
-	delete(labels, "opencode.gateway.upstream_url")
-	labels["opencode.gateway.proxy_urls"] = strings.Join(instance.ProxyURLs, ",")
-	labels["opencode.gateway.max_concurrency"] = strconv.Itoa(instance.MaxConcurrency)
-	labels["opencode.gateway.queue_size"] = strconv.Itoa(instance.QueueSize)
+	labels["dualroute.gateway.name"] = instance.Name
+	delete(labels, "dualroute.gateway.upstream_url")
+	labels["dualroute.gateway.proxy_urls"] = strings.Join(instance.ProxyURLs, ",")
+	labels["dualroute.gateway.max_concurrency"] = strconv.Itoa(instance.MaxConcurrency)
+	labels["dualroute.gateway.queue_size"] = strconv.Itoa(instance.QueueSize)
+	labels["dualroute.gateway.provider"] = instance.Provider
 	payload := map[string]any{"Image": original.Config.Image, "Env": environment, "Labels": labels, "ExposedPorts": original.Config.ExposedPorts,
 		"HostConfig": map[string]any{"NetworkMode": original.HostConfig.NetworkMode, "Binds": original.HostConfig.Binds, "ReadonlyRootfs": original.HostConfig.ReadonlyRootfs, "SecurityOpt": original.HostConfig.SecurityOpt, "Tmpfs": original.HostConfig.Tmpfs, "RestartPolicy": original.HostConfig.RestartPolicy}}
 	encoded, _ := json.Marshal(payload)
@@ -527,19 +531,49 @@ func (s *Server) discoverInstances() ([]Instance, error) {
 	instances := make([]Instance, 0, len(containers))
 	for _, container := range containers {
 		name := strings.TrimPrefix(first(container.Names), "/")
-		if configured := container.Labels["opencode.gateway.name"]; configured != "" {
+		if configured := container.Labels["dualroute.gateway.name"]; configured != "" {
 			name = configured
 		}
 		instances = append(instances, Instance{
 			Name: name, Container: strings.TrimPrefix(first(container.Names), "/"), ContainerID: container.ID, Managed: true,
 			URL: "http://" + strings.TrimPrefix(first(container.Names), "/") + ":13339", Status: container.State,
-			ProxyURLs:      split(container.Labels["opencode.gateway.proxy_urls"]),
-			MaxConcurrency: positiveInt(container.Labels["opencode.gateway.max_concurrency"], 4),
-			QueueSize:      nonNegativeInt(container.Labels["opencode.gateway.queue_size"], 8),
+			ProxyURLs:      split(container.Labels["dualroute.gateway.proxy_urls"]),
+			MaxConcurrency: positiveInt(container.Labels["dualroute.gateway.max_concurrency"], 4),
+			QueueSize:      nonNegativeInt(container.Labels["dualroute.gateway.queue_size"], 8),
+			Provider:       providerOrDefault(container.Labels["dualroute.gateway.provider"]),
 		})
 	}
 	sort.Slice(instances, func(i, j int) bool { return instances[i].Name < instances[j].Name })
 	return instances, nil
+}
+
+func providerOrDefault(provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == ProviderOpenCode {
+		return ProviderOpenCode
+	}
+	return ProviderTokenRouter
+}
+
+func upstreamURLForProvider(provider string) string {
+	if providerOrDefault(provider) == ProviderOpenCode {
+		return openCodeUpstreamURL
+	}
+	return defaultUpstreamURL
+}
+
+func upstreamModelForProvider(provider string) string {
+	if providerOrDefault(provider) == ProviderOpenCode {
+		return openCodeModel
+	}
+	return tokenRouterModel
+}
+
+func providerThinkingTokenBudget(provider string) string {
+	if providerOrDefault(provider) == ProviderOpenCode {
+		return "8192"
+	}
+	return "0"
 }
 
 func (s *Server) refreshInstances() error {

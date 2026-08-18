@@ -3,7 +3,7 @@ package main
 import (
 	"log/slog"
 	"net/http"
-	"opencode-gateway-next/internal/gateway"
+	"dualroute-gateway/internal/gateway"
 	"os"
 	"time"
 )

@@ -1,3 +1,3 @@
-module opencode-gateway-next
+module dualroute-gateway
 
 go 1.22

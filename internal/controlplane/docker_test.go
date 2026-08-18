@@ -43,7 +43,7 @@ func TestCreateUsesFixedImageNetworkAndManagedLabel(t *testing.T) {
 	if labels[managedLabel] != "true" {
 		t.Fatalf("managed label = %v", labels[managedLabel])
 	}
-	if _, exists := labels["opencode.gateway.upstream_url"]; exists {
+	if _, exists := labels["dualroute.gateway.upstream_url"]; exists {
 		t.Fatalf("upstream URL must not be configurable through labels: %v", labels)
 	}
 	if strings.Contains(fmt.Sprint(labels), "zen-secret-key") {
@@ -54,12 +54,37 @@ func TestCreateUsesFixedImageNetworkAndManagedLabel(t *testing.T) {
 		t.Fatalf("network = %v", host["NetworkMode"])
 	}
 	binds := host["Binds"].([]any)
-	if len(binds) != 1 || binds[0] != "opencode-gateway-data-gateway-b:/data:rw" {
+	if len(binds) != 1 || binds[0] != "dualroute-gateway-data-gateway-b:/data:rw" {
 		t.Fatalf("binds = %v", binds)
 	}
 	environment := fmt.Sprint(payload["Env"])
-	if !strings.Contains(environment, "MAX_RETRIES=0") || !strings.Contains(environment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(environment, "OPENCODE_API_KEY=zen-secret-key") {
+	if !strings.Contains(environment, "MAX_RETRIES=0") || !strings.Contains(environment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(environment, "UPSTREAM_API_KEY=zen-secret-key") {
 		t.Fatalf("environment = %s", environment)
+	}
+}
+
+func TestCreateUsesProviderSpecificUpstreamConfiguration(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, `{"Id":"abc"}`)
+	}))
+	defer server.Close()
+	docker := &dockerClient{client: server.Client(), base: server.URL}
+	instance := Instance{Name: "gateway-opencode", Provider: ProviderOpenCode, MaxConcurrency: 4, QueueSize: 8}
+	if err := docker.create(Config{GatewayImage: "gateway:test", DockerNetwork: "gateway-network", InstanceToken: "internal"}, instance, []string{"open-key"}, "upstream-key"); err != nil {
+		t.Fatal(err)
+	}
+	environment := fmt.Sprint(payload["Env"])
+	if !strings.Contains(environment, "UPSTREAM_PROVIDER=opencode") || !strings.Contains(environment, "UPSTREAM_URL="+openCodeUpstreamURL) || !strings.Contains(environment, "UPSTREAM_MODEL="+openCodeModel) {
+		t.Fatalf("environment = %s", environment)
+	}
+	labels := payload["Labels"].(map[string]any)
+	if labels["dualroute.gateway.provider"] != ProviderOpenCode {
+		t.Fatalf("provider label = %v", labels["dualroute.gateway.provider"])
 	}
 }
 
@@ -131,10 +156,10 @@ func TestDiscoverInstancesIncludesDockerContainerID(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1.43/containers/json" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
 		}
-		_, _ = io.WriteString(w, `[{"Id":"bfb532310b1e-full-id","Names":["/gateway-b"],"State":"running","Labels":{"opencode.gateway.managed":"true","opencode.gateway.name":"gateway-b"}}]`)
+		_, _ = io.WriteString(w, `[{"Id":"bfb532310b1e-full-id","Names":["/gateway-b"],"State":"running","Labels":{"dualroute.gateway.managed":"true","dualroute.gateway.name":"gateway-b"}}]`)
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	s.docker = &dockerClient{client: server.Client(), base: server.URL}
 	instances, err := s.discoverInstances()
 	if err != nil {
@@ -154,7 +179,7 @@ func TestInstanceCreateRemovesUnhealthyContainer(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.43/containers/create":
 			w.WriteHeader(http.StatusCreated)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1.43/containers/gateway-b/json":
-			_, _ = io.WriteString(w, `{"Id":"gateway-b-id","Name":"/gateway-b","Config":{"Image":"gateway:test","Labels":{"opencode.gateway.managed":"true"}},"State":{"Status":"running"}}`)
+			_, _ = io.WriteString(w, `{"Id":"gateway-b-id","Name":"/gateway-b","Config":{"Image":"gateway:test","Labels":{"dualroute.gateway.managed":"true"}},"State":{"Status":"running"}}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.43/containers/gateway-b-id/start":
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1.43/containers/gateway-b-id":
@@ -165,7 +190,7 @@ func TestInstanceCreateRemovesUnhealthyContainer(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir(), GatewayImage: "gateway:test", DockerNetwork: "gateway-network", MaxInstances: 16})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), GatewayImage: "gateway:test", DockerNetwork: "gateway-network", MaxInstances: 16})
 	s.docker = &dockerClient{client: server.Client(), base: server.URL, probe: func(string) error { return errors.New("unhealthy") }}
 	req := httptest.NewRequest(http.MethodPost, "/api/instances", strings.NewReader(`{"name":"gateway-b","zen_api_key":"zen-secret-key","max_concurrency":4,"queue_size":8}`))
 	res := httptest.NewRecorder()
@@ -240,10 +265,10 @@ func TestValidateInstanceRequestAcceptsSOCKS5(t *testing.T) {
 	}
 }
 
-func TestValidateInstanceRequestRequiresValidZenAPIKeyOnCreate(t *testing.T) {
+func TestValidateInstanceRequestRequiresUpstreamAPIKeyOnCreate(t *testing.T) {
 	request := instanceRequest{MaxConcurrency: 4, QueueSize: 8}
-	if code, _ := validateInstanceRequest(&request, true); code != 0 || request.ZenAuthMode != "public" || request.ZenAPIKey != "public" {
-		t.Fatalf("default public mode rejected: %d mode=%q key=%q", code, request.ZenAuthMode, request.ZenAPIKey)
+	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
+		t.Fatalf("missing upstream API key status = %d", code)
 	}
 	request = instanceRequest{ZenAuthMode: "custom", MaxConcurrency: 4, QueueSize: 8}
 	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
@@ -259,10 +284,10 @@ func TestValidateInstanceRequestRequiresValidZenAPIKeyOnCreate(t *testing.T) {
 	}
 }
 
-func TestValidateInstanceRequestSupportsPublicKey(t *testing.T) {
+func TestValidateInstanceRequestRejectsPublicKeyMode(t *testing.T) {
 	request := instanceRequest{ZenAuthMode: "public", MaxConcurrency: 4, QueueSize: 8}
-	if code, message := validateInstanceRequest(&request, true); code != 0 || request.ZenAPIKey != "public" {
-		t.Fatalf("public mode rejected: %d %s key=%q", code, message, request.ZenAPIKey)
+	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
+		t.Fatalf("public mode accepted: %d", code)
 	}
 }
 
@@ -332,14 +357,14 @@ func TestCreateWithSpecPreservesComposeMetadataAndMounts(t *testing.T) {
 	}
 	environment := payload["Env"].([]any)
 	joinedEnvironment := fmt.Sprint(environment)
-	if !strings.Contains(joinedEnvironment, "REQUEST_TIMEOUT=9m") || !strings.Contains(joinedEnvironment, "MAX_CONCURRENCY=6") || !strings.Contains(joinedEnvironment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(joinedEnvironment, "OPENCODE_API_KEY=zen-secret-key") {
+	if !strings.Contains(joinedEnvironment, "REQUEST_TIMEOUT=9m") || !strings.Contains(joinedEnvironment, "MAX_CONCURRENCY=6") || !strings.Contains(joinedEnvironment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(joinedEnvironment, "UPSTREAM_API_KEY=zen-secret-key") {
 		t.Fatalf("environment = %v", environment)
 	}
 	labels := payload["Labels"].(map[string]any)
 	if labels["com.docker.compose.service"] != "gateway-a" {
 		t.Fatalf("compose label = %v", labels["com.docker.compose.service"])
 	}
-	if _, exists := labels["opencode.gateway.upstream_url"]; exists {
+	if _, exists := labels["dualroute.gateway.upstream_url"]; exists {
 		t.Fatalf("upstream URL label was retained: %v", labels)
 	}
 	if strings.Contains(fmt.Sprint(labels), "zen-secret-key") {
@@ -376,7 +401,7 @@ func TestSelectMihomoProxyGroup(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", MihomoAPIURL: server.URL, DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", MihomoAPIURL: server.URL, DataDir: t.TempDir()})
 	if err := s.selectMihomoProxyGroup("GATEWAY-SLOT-2", "Japan (2)"); err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +418,7 @@ func TestValidateMihomoSubscriptionUsesClashUserAgent(t *testing.T) {
 		_, _ = io.WriteString(w, "proxies:\n  - name: test\n    type: socks5\n    server: 127.0.0.1\n    port: 1080\n")
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	s.client = server.Client()
 	if err := s.validateMihomoSubscription(context.Background(), server.URL+"?token=secret"); err != nil {
 		t.Fatal(err)
@@ -405,7 +430,7 @@ func TestValidateMihomoSubscriptionRejectsNonClashWithoutLeakingURL(t *testing.T
 		_, _ = io.WriteString(w, "dmxlc3M6Ly9leGFtcGxl")
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	s.client = server.Client()
 	secretURL := server.URL + "?token=do-not-leak"
 	err := s.validateMihomoSubscription(context.Background(), secretURL)
@@ -422,7 +447,7 @@ func TestValidateMihomoSubscriptionReportsHTTPStatus(t *testing.T) {
 		http.Error(w, "expired", http.StatusForbidden)
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir()})
 	s.client = server.Client()
 	err := s.validateMihomoSubscription(context.Background(), server.URL)
 	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
@@ -438,7 +463,7 @@ func TestGetMihomoGroupAndUniqueNodes(t *testing.T) {
 		_, _ = io.WriteString(w, `{"name":"GATEWAY","now":"Japan","all":["DIRECT","Japan","Hong Kong","Japan","REJECT"]}`)
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", MihomoAPIURL: server.URL, DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", MihomoAPIURL: server.URL, DataDir: t.TempDir()})
 	group, err := s.getMihomoGroup()
 	if err != nil {
 		t.Fatal(err)
@@ -457,7 +482,7 @@ func TestRoutableMihomoNodesRejectsDirectEntries(t *testing.T) {
 		_, _ = io.WriteString(w, `{"proxies":[{"name":"direct-looking-node","type":"Direct"},{"name":"proxy-node","type":"VLESS"},{"name":"group-node","type":"Selector"}]}`)
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", MihomoAPIURL: server.URL, MihomoMaxSlots: 8, DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", MihomoAPIURL: server.URL, MihomoMaxSlots: 8, DataDir: t.TempDir()})
 	nodes := s.routableMihomoNodes([]string{"direct-looking-node", "proxy-node", "group-node"})
 	if fmt.Sprint(nodes) != "[proxy-node]" {
 		t.Fatalf("nodes = %v", nodes)
@@ -476,7 +501,7 @@ func TestRoutableMihomoNodesKeepsFortyCandidates(t *testing.T) {
 		_, _ = io.WriteString(w, `{"proxies":[`+strings.Join(proxies, ",")+"]}")
 	}))
 	defer server.Close()
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", MihomoAPIURL: server.URL, MihomoMaxSlots: 64, DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", MihomoAPIURL: server.URL, MihomoMaxSlots: 64, DataDir: t.TempDir()})
 	values := make([]string, 0, 40)
 	for index := 1; index <= 40; index++ {
 		values = append(values, fmt.Sprintf("node-%02d", index))
@@ -623,11 +648,11 @@ func TestReplaceKeepsOldContainerWhenReplacementIsUnhealthy(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && (r.URL.Path == "/v1.43/containers/gateway-a/json" || r.URL.Path == "/v1.43/containers/old-id/json"):
-			_, _ = io.WriteString(w, `{"Id":"old-id","Name":"/gateway-a","Config":{"Image":"gateway:test","Env":["REQUEST_TIMEOUT=5m"],"Labels":{"opencode.gateway.managed":"true"},"ExposedPorts":{"13339/tcp":{}}},"HostConfig":{"NetworkMode":"gateway-network","Binds":["/srv/a:/data:rw"],"ReadonlyRootfs":true,"SecurityOpt":[],"Tmpfs":{},"RestartPolicy":{"Name":"unless-stopped"}},"State":{"Status":"running"}}`)
+			_, _ = io.WriteString(w, `{"Id":"old-id","Name":"/gateway-a","Config":{"Image":"gateway:test","Env":["REQUEST_TIMEOUT=5m"],"Labels":{"dualroute.gateway.managed":"true"},"ExposedPorts":{"13339/tcp":{}}},"HostConfig":{"NetworkMode":"gateway-network","Binds":["/srv/a:/data:rw"],"ReadonlyRootfs":true,"SecurityOpt":[],"Tmpfs":{},"RestartPolicy":{"Name":"unless-stopped"}},"State":{"Status":"running"}}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.43/containers/create":
 			w.WriteHeader(http.StatusCreated)
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.43/containers/gateway-a-next-"):
-			_, _ = io.WriteString(w, `{"Id":"next-id","Name":"/gateway-a-next","Config":{"Image":"gateway:test","Labels":{"opencode.gateway.managed":"true"}},"State":{"Status":"created"}}`)
+			_, _ = io.WriteString(w, `{"Id":"next-id","Name":"/gateway-a-next","Config":{"Image":"gateway:test","Labels":{"dualroute.gateway.managed":"true"}},"State":{"Status":"created"}}`)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1.43/containers/next-id/start"):
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1.43/containers/next-id":

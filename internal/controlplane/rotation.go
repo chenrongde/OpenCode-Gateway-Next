@@ -45,7 +45,7 @@ func mihomoGroupForProxyURL(raw string) (string, bool) {
 		return "", false
 	}
 	host := strings.ToLower(parsed.Hostname())
-	if host != "mihomo" && host != "opencode-gateway-mihomo" {
+	if host != "mihomo" && host != "dualroute-gateway-mihomo" {
 		return "", false
 	}
 	port, err := strconv.Atoi(parsed.Port())

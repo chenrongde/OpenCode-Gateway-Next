@@ -12,8 +12,8 @@ import (
 
 func TestMihomoGroupForProxyURL(t *testing.T) {
 	for raw, want := range map[string]string{
-		"socks5h://mihomo:10801":                 "GATEWAY-SLOT-1",
-		"socks5://opencode-gateway-mihomo:10808": "GATEWAY-SLOT-8",
+		"socks5h://mihomo:10801":                  "GATEWAY-SLOT-1",
+		"socks5://dualroute-gateway-mihomo:10808": "GATEWAY-SLOT-8",
 	} {
 		got, ok := mihomoGroupForProxyURL(raw)
 		if !ok || got != want {
@@ -58,7 +58,7 @@ func TestRotateInstanceMihomoSlotSkipsOccupiedEgress(t *testing.T) {
 	}))
 	defer gateway.Close()
 
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", MihomoAPIURL: controller.URL, DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", MihomoAPIURL: controller.URL, DataDir: t.TempDir()})
 	instance := Instance{Name: "gateway-a", URL: gateway.URL, Container: "gateway-a", Status: "running"}
 	result, err := s.rotateInstanceMihomoSlot(instance, "socks5h://mihomo:10801", "192.0.2.1", "duplicate_egress", map[string]struct{}{"192.0.2.1": {}, "192.0.2.2": {}})
 	if err != nil {
@@ -111,7 +111,7 @@ func TestReconcileEgressesRotatesDuplicateAcrossInstances(t *testing.T) {
 	second := gateway("socks5h://mihomo:10802", "GATEWAY-SLOT-2")
 	defer second.Close()
 
-	s := New(Config{AdminToken: "admin", InstanceToken: "internal", MihomoAPIURL: controller.URL, DataDir: t.TempDir()})
+	s := New(Config{InstanceToken: "internal", MihomoAPIURL: controller.URL, DataDir: t.TempDir()})
 	s.instances = []Instance{
 		{Name: "gateway-a", URL: first.URL, Container: "gateway-a", Status: "running", ProxyURLs: []string{"socks5h://mihomo:10801"}},
 		{Name: "gateway-b", URL: second.URL, Container: "gateway-b", Status: "running", ProxyURLs: []string{"socks5h://mihomo:10802"}},

@@ -1,13 +1,13 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,10 +23,18 @@ import (
 	"unicode"
 )
 
-//go:embed web/index.html web/app.js web/style.css
+//go:embed web/index.html web/app.js web/style.css web/pages/*.html
 var assets embed.FS
 
-const defaultUpstreamURL = "https://opencode.ai/zen"
+const (
+	ProviderTokenRouter = "tokenrouter"
+	ProviderOpenCode    = "opencode"
+
+	defaultUpstreamURL  = "https://api.tokenrouter.com/v1"
+	openCodeUpstreamURL = "https://opencode.ai/zen"
+	tokenRouterModel    = "deepseek/deepseek-v4-pro-0813-free"
+	openCodeModel       = "deepseek-v4-flash-free"
+)
 
 const (
 	zenAuthModePublic = "public"
@@ -36,7 +44,6 @@ const (
 type Config struct {
 	ListenAddr      string
 	APIListenAddr   string
-	AdminToken      string
 	InstanceToken   string
 	Instances       []Instance
 	DataDir         string
@@ -49,7 +56,9 @@ type Config struct {
 	MihomoAPIURL    string
 	MihomoMaxSlots  int
 	MaxInstances    int
-	BootstrapKeys   []string
+	// BootstrapKeys remains for programmatic migrations. New deployments start
+	// with no gateway keys and add them through the control plane.
+	BootstrapKeys []string
 }
 
 type Instance struct {
@@ -62,6 +71,7 @@ type Instance struct {
 	ProxyURLs      []string `json:"proxy_urls,omitempty"`
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
 	QueueSize      int      `json:"queue_size,omitempty"`
+	Provider       string   `json:"provider"`
 }
 type Server struct {
 	cfg              Config
@@ -81,6 +91,13 @@ type Server struct {
 	apiCircuits      map[string]apiCircuit
 	apiReadiness     map[string]apiReadiness
 	apiCursor        atomic.Uint64
+	authMu           sync.Mutex
+	auth             adminCredential
+	sessions         map[string]session
+}
+
+type GatewayKey struct {
+	Key string `json:"key"`
 }
 
 type apiCircuit struct {
@@ -175,12 +192,14 @@ type Summary struct {
 	ZenAuthMode    string            `json:"zen_auth_mode"`
 	ProxyURLs      []string          `json:"proxy_urls"`
 	QueueSize      int               `json:"queue_size"`
+	Provider       string            `json:"provider"`
 	InTrafficPool  bool              `json:"in_traffic_pool"`
 	InstanceURL    string            `json:"-"`
 }
 
 type instanceRequest struct {
 	Name           string   `json:"name"`
+	Provider       string   `json:"provider"`
 	ZenAPIKey      string   `json:"zen_api_key"`
 	ZenAuthMode    string   `json:"auth_mode"`
 	ProxyURLs      []string `json:"proxy_urls"`
@@ -189,12 +208,9 @@ type instanceRequest struct {
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{ListenAddr: env("CONTROL_LISTEN_ADDR", "0.0.0.0:13338"), APIListenAddr: env("API_LISTEN_ADDR", "0.0.0.0:13337"), AdminToken: os.Getenv("ADMIN_TOKEN"), InstanceToken: os.Getenv("INSTANCE_ADMIN_TOKEN"), DataDir: env("CONTROL_DATA_DIR", "/control-data"), DockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"), DockerNetwork: env("GATEWAY_NETWORK", "opencode-gateway-next_default"), GatewayImage: env("GATEWAY_IMAGE", "opencode-gateway-next-gateway:latest"), DirectFallback: compatibleBoolEnv("DIRECT_FALLBACK", "NGINX_DIRECT_FALLBACK", false), MihomoContainer: env("MIHOMO_CONTAINER", "opencode-gateway-mihomo"), MihomoConfigDir: env("MIHOMO_CONFIG_DIR", "/mihomo-config"), MihomoAPIURL: strings.TrimRight(env("MIHOMO_API_URL", "http://mihomo:9090"), "/"), MihomoMaxSlots: positiveIntEnv("MIHOMO_MAX_SLOTS", 64), MaxInstances: positiveIntEnv("MAX_INSTANCES", 16), BootstrapKeys: split(os.Getenv("GATEWAY_KEYS"))}
+	c := Config{ListenAddr: env("CONTROL_LISTEN_ADDR", "0.0.0.0:13338"), APIListenAddr: env("API_LISTEN_ADDR", "0.0.0.0:13337"), InstanceToken: os.Getenv("INSTANCE_ADMIN_TOKEN"), DataDir: env("CONTROL_DATA_DIR", "/control-data"), DockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"), DockerNetwork: env("GATEWAY_NETWORK", "dualroute-gateway_default"), GatewayImage: env("GATEWAY_IMAGE", "dualroute-gateway-gateway:latest"), DirectFallback: compatibleBoolEnv("DIRECT_FALLBACK", "NGINX_DIRECT_FALLBACK", false), MihomoContainer: env("MIHOMO_CONTAINER", "dualroute-gateway-mihomo"), MihomoConfigDir: env("MIHOMO_CONFIG_DIR", "/mihomo-config"), MihomoAPIURL: strings.TrimRight(env("MIHOMO_API_URL", "http://mihomo:9090"), "/"), MihomoMaxSlots: positiveIntEnv("MIHOMO_MAX_SLOTS", 64), MaxInstances: positiveIntEnv("MAX_INSTANCES", 16)}
 	if c.MihomoMaxSlots > 128 {
 		c.MihomoMaxSlots = 128
-	}
-	if c.InstanceToken == "" {
-		c.InstanceToken = c.AdminToken
 	}
 	for i, raw := range split(os.Getenv("GATEWAY_INSTANCES")) {
 		parts := strings.SplitN(raw, "=", 2)
@@ -209,14 +225,13 @@ func LoadConfig() (Config, error) {
 		instance.URL = strings.TrimRight(instance.URL, "/")
 		c.Instances = append(c.Instances, instance)
 	}
-	if c.AdminToken == "" || c.InstanceToken == "" {
-		return c, errors.New("ADMIN_TOKEN and INSTANCE_ADMIN_TOKEN are required")
-	}
 	return c, nil
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), zenKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64)}
+	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), zenKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64), sessions: make(map[string]session)}
+	s.loadInstanceToken()
+	s.loadAuth()
 	s.loadKeys()
 	s.loadZenKeys()
 	if len(s.keys) == 0 {
@@ -253,11 +268,21 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 	apiKey := requestBearer(r)
 	s.mu.RLock()
 	instances := append([]Instance(nil), s.instances...)
-	shared := containsKey(s.keys, apiKey)
+	shared := s.hasGatewayKeyLocked(apiKey)
 	s.mu.RUnlock()
 	if apiKey == "" || !shared {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
+	}
+	if isModelsRequest(r.URL.Path) {
+		s.models(w, instances)
+		return
+	}
+	if provider, required, err := requestedProvider(r); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "unsupported_model", err)
+		return
+	} else if required {
+		instances = instancesForProvider(instances, provider)
 	}
 	selected := s.readyTrafficPool(selectTrafficPool(instances, s.cfg.DirectFallback))
 	if len(selected) == 0 {
@@ -294,6 +319,51 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		req.Host = target.Host
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func isModelsRequest(path string) bool {
+	return path == "/v1/models" || path == "/openai/v1/models"
+}
+
+func requestedProvider(r *http.Request) (string, bool, error) {
+	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return "", false, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		return "", false, fmt.Errorf("request_body_unreadable")
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var request struct {
+		Model string `json:"model"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &request) != nil || strings.TrimSpace(request.Model) == "" {
+		return "", false, nil
+	}
+	switch strings.TrimSpace(request.Model) {
+	case tokenRouterModel:
+		return ProviderTokenRouter, true, nil
+	case openCodeModel:
+		return ProviderOpenCode, true, nil
+	default:
+		return "", false, fmt.Errorf("model must be %q or %q", tokenRouterModel, openCodeModel)
+	}
+}
+
+func (s *Server) models(w http.ResponseWriter, instances []Instance) {
+	providers := make(map[string]bool)
+	for _, instance := range instances {
+		providers[providerOrDefault(instance.Provider)] = true
+	}
+	models := make([]map[string]string, 0, 2)
+	if providers[ProviderTokenRouter] {
+		models = append(models, map[string]string{"id": tokenRouterModel, "object": "model", "owned_by": "tokenrouter"})
+	}
+	if providers[ProviderOpenCode] {
+		models = append(models, map[string]string{"id": openCodeModel, "object": "model", "owned_by": "opencode"})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
 }
 
 func (s *Server) readyTrafficPool(instances []Instance) []Instance {
@@ -435,15 +505,27 @@ func (s *Server) releaseAPIInstance(name string) {
 	}
 }
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case "/", "/instances", "/mihomo", "/keys", "/logs", "/tokens":
-	default:
+	page := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
+	if page == "" {
+		page = "instances"
+	}
+	titles := map[string]string{"instances": "实例与出口", "mihomo": "Mihomo 转换", "keys": "访问密钥", "logs": "审计与日志", "tokens": "API Token 统计"}
+	title, ok := titles[page]
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	data, _ := assets.ReadFile("web/index.html")
+	layout, _ := assets.ReadFile("web/index.html")
+	content, err := assets.ReadFile("web/pages/" + page + ".html")
+	if err != nil {
+		http.Error(w, `{"error":"page_unavailable"}`, http.StatusInternalServerError)
+		return
+	}
+	data := strings.ReplaceAll(string(layout), "{{PAGE_CONTENT}}", string(content))
+	data = strings.ReplaceAll(data, "{{PAGE_NAME}}", page)
+	data = strings.ReplaceAll(data, "{{PAGE_TITLE}}", title)
 	w.Header().Set("content-type", "text/html; charset=utf-8")
-	w.Write(data)
+	_, _ = io.WriteString(w, data)
 }
 func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/static/")
@@ -463,11 +545,30 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 func (s *Server) api(w http.ResponseWriter, r *http.Request) {
-	if !bearer(r, s.cfg.AdminToken) {
-		http.Error(w, `{"error":"unauthorized"}`, 401)
+	path := strings.TrimPrefix(r.URL.Path, "/api")
+	switch {
+	case path == "/auth/status" && r.Method == http.MethodGet:
+		s.authStatus(w, r)
+		return
+	case path == "/auth/login" && r.Method == http.MethodPost:
+		s.login(w, r)
+		return
+	case path == "/auth/password" && r.Method == http.MethodPost:
+		s.changePassword(w, r)
+		return
+	case path == "/auth/logout" && r.Method == http.MethodPost:
+		s.logout(w, r)
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/api")
+	_, authenticated, mustChange := s.authenticated(r)
+	if !authenticated {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	if mustChange {
+		http.Error(w, `{"error":"password_change_required"}`, http.StatusForbidden)
+		return
+	}
 	switch {
 	case path == "/overview" && r.Method == "GET":
 		s.overview(w)
@@ -479,7 +580,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		writeJSON(w, 200, map[string]any{"keys": keys})
 	case path == "/keys" && r.Method == "POST":
-		s.createKey(w)
+		s.createKey(w, r)
 	case path == "/mihomo" && r.Method == "GET":
 		s.mihomoStatus(w)
 	case path == "/mihomo/probe" && r.Method == "POST":
@@ -555,9 +656,9 @@ func (s *Server) instanceCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"max_instances_reached"}`, http.StatusConflict)
 		return
 	}
-	instance := Instance{Name: request.Name, Container: request.Name, URL: "http://" + request.Name + ":13339", Managed: true, Status: "created", ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize}
+	instance := Instance{Name: request.Name, Container: request.Name, URL: "http://" + request.Name + ":13339", Managed: true, Status: "created", ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider}
 	s.mu.RLock()
-	keys := append([]string(nil), s.keys...)
+	keys := s.gatewayKeysLocked()
 	s.mu.RUnlock()
 	if err := s.docker.create(s.cfg, instance, keys, request.ZenAPIKey); err != nil {
 		writeAPIError(w, http.StatusBadGateway, "create_failed", err)
@@ -623,13 +724,27 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 		return
 	}
 	request.Name = name
+	if request.Provider == "" {
+		s.mu.RLock()
+		for _, instance := range s.instances {
+			if instance.Name == name {
+				request.Provider = instance.Provider
+				break
+			}
+		}
+		s.mu.RUnlock()
+	}
 	s.mu.RLock()
 	currentKey := s.zenKeys[name]
 	s.mu.RUnlock()
 	if strings.TrimSpace(request.ZenAuthMode) == "" && strings.TrimSpace(request.ZenAPIKey) == "" {
 		request.ZenAuthMode, request.ZenAPIKey = zenAuthModeForKey(currentKey), currentKey
 		if request.ZenAuthMode == "" {
-			request.ZenAuthMode = zenAuthModePublic
+			if request.Provider == ProviderOpenCode {
+				request.ZenAuthMode = zenAuthModePublic
+			} else {
+				request.ZenAuthMode = zenAuthModeCustom
+			}
 		}
 	}
 	if request.ZenAuthMode == zenAuthModeCustom && strings.TrimSpace(request.ZenAPIKey) == "" && currentKey != "" && currentKey != zenAuthModePublic {
@@ -642,10 +757,10 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 	if request.ZenAuthMode == zenAuthModePublic {
 		request.ZenAPIKey = zenAuthModePublic
 	}
+	instance := Instance{Name: name, Container: name, URL: "http://" + name + ":13339", Managed: true, ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider}
 	s.mu.RLock()
-	keys := append([]string(nil), s.keys...)
+	keys := s.gatewayKeysLocked()
 	s.mu.RUnlock()
-	instance := Instance{Name: name, Container: name, URL: "http://" + name + ":13339", Managed: true, ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize}
 	if err := s.docker.replace(s.cfg, instance, keys, request.ZenAPIKey); err != nil {
 		http.Error(w, `{"error":"update_failed"}`, http.StatusBadGateway)
 		return
@@ -664,19 +779,29 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 }
 
 func validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int, string) {
+	request.Provider = strings.ToLower(strings.TrimSpace(request.Provider))
+	if request.Provider == "" {
+		request.Provider = ProviderTokenRouter
+	}
+	if request.Provider != ProviderTokenRouter && request.Provider != ProviderOpenCode {
+		return http.StatusBadRequest, `{"error":"invalid_provider"}`
+	}
 	request.ZenAuthMode = strings.ToLower(strings.TrimSpace(request.ZenAuthMode))
 	request.ZenAPIKey = strings.TrimSpace(request.ZenAPIKey)
 	if request.ZenAuthMode == "" {
 		if request.ZenAPIKey != "" {
 			request.ZenAuthMode = zenAuthModeCustom
 		} else if defaultLimits {
-			request.ZenAuthMode = zenAuthModePublic
+			request.ZenAuthMode = zenAuthModeCustom
 		}
 	}
 	if request.ZenAuthMode != "" && request.ZenAuthMode != zenAuthModePublic && request.ZenAuthMode != zenAuthModeCustom {
 		return http.StatusBadRequest, `{"error":"invalid_auth_mode"}`
 	}
 	if request.ZenAuthMode == zenAuthModePublic {
+		if request.Provider != ProviderOpenCode {
+			return http.StatusBadRequest, `{"error":"public_auth_not_supported"}`
+		}
 		request.ZenAPIKey = zenAuthModePublic
 	}
 	if request.ZenAuthMode == zenAuthModeCustom && request.ZenAPIKey == "" {
@@ -770,7 +895,7 @@ func (s *Server) instanceAction(w http.ResponseWriter, r *http.Request, name str
 	}
 	if action == "start" || action == "restart" {
 		s.mu.RLock()
-		keys := append([]string(nil), s.keys...)
+		keys := s.gatewayKeysLocked()
 		s.mu.RUnlock()
 		payload, _ := json.Marshal(map[string]any{"keys": keys})
 		instance := Instance{Name: name, URL: "http://" + name + ":13339"}
@@ -1126,6 +1251,7 @@ func (s *Server) summary(instance Instance) Summary {
 	out.MaxConcurrency = instance.MaxConcurrency
 	out.ProxyURLs = append([]string(nil), instance.ProxyURLs...)
 	out.QueueSize = instance.QueueSize
+	out.Provider = instance.Provider
 	if instance.Status != "" && instance.Status != "running" {
 		return out
 	}
@@ -1191,14 +1317,33 @@ func (s *Server) call(instance Instance, method, path string, body io.Reader, ou
 	}
 	return nil
 }
-func (s *Server) createKey(w http.ResponseWriter) {
-	buf := make([]byte, 24)
-	if _, err := rand.Read(buf); err != nil {
-		http.Error(w, `{"error":"key_generation_failed"}`, 500)
+func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request); err != nil {
+		http.Error(w, `{"error":"invalid_body"}`, http.StatusBadRequest)
 		return
 	}
-	key := "gw_" + hex.EncodeToString(buf)
+	key := strings.TrimSpace(request.Key)
+	if key == "" {
+		buf := make([]byte, 24)
+		if _, err := rand.Read(buf); err != nil {
+			http.Error(w, `{"error":"key_generation_failed"}`, http.StatusInternalServerError)
+			return
+		}
+		key = "gw_" + hex.EncodeToString(buf)
+	}
+	if len(key) > 512 || strings.IndexFunc(key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		http.Error(w, `{"error":"invalid_gateway_key"}`, http.StatusBadRequest)
+		return
+	}
 	s.mu.Lock()
+	if s.hasGatewayKeyLocked(key) {
+		s.mu.Unlock()
+		http.Error(w, `{"error":"gateway_key_exists"}`, http.StatusConflict)
+		return
+	}
 	s.keys = append(s.keys, key)
 	result := s.syncKeysLocked()
 	s.persistLocked()
@@ -1212,11 +1357,6 @@ func (s *Server) deleteKey(w http.ResponseWriter, key string) {
 		if item != key {
 			next = append(next, item)
 		}
-	}
-	if len(next) == 0 {
-		s.mu.Unlock()
-		http.Error(w, `{"error":"at_least_one_key_required"}`, 409)
-		return
 	}
 	s.keys = next
 	result := s.syncKeysLocked()
@@ -1241,7 +1381,7 @@ func (s *Server) syncKeysLocked() syncResult {
 		if instance.Status != "" && instance.Status != "running" {
 			continue
 		}
-		payload, _ := json.Marshal(map[string]any{"keys": append([]string(nil), s.keys...)})
+		payload, _ := json.Marshal(map[string]any{"keys": s.gatewayKeysLocked()})
 		if err := s.call(instance, "PUT", "/admin/keys", strings.NewReader(string(payload)), nil); err != nil {
 			result.Failed[instance.Name] = err.Error()
 		} else {
@@ -1282,8 +1422,27 @@ func (s *Server) currentInstances() []Instance {
 }
 func (s *Server) loadKeys() {
 	data, err := os.ReadFile(s.cfg.DataDir + "/keys.json")
-	if err == nil {
-		json.Unmarshal(data, &s.keys)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	var records []GatewayKey
+	if json.Unmarshal(data, &records) == nil {
+		for _, record := range records {
+			if record.Key == "" {
+				continue
+			}
+			s.keys = append(s.keys, record.Key)
+		}
+		return
+	}
+	var legacy []string
+	if json.Unmarshal(data, &legacy) == nil {
+		for _, key := range legacy {
+			if key == "" {
+				continue
+			}
+			s.keys = append(s.keys, key)
+		}
 	}
 }
 
@@ -1335,6 +1494,30 @@ func containsKey(keys []string, expected string) bool {
 		}
 	}
 	return false
+}
+
+func (s *Server) hasGatewayKeyLocked(key string) bool {
+	for _, known := range s.keys {
+		if len(known) == len(key) && subtle.ConstantTimeCompare([]byte(known), []byte(key)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) gatewayKeysLocked() []string {
+	return append([]string(nil), s.keys...)
+}
+
+func instancesForProvider(instances []Instance, provider string) []Instance {
+	provider = providerOrDefault(provider)
+	matched := make([]Instance, 0, len(instances))
+	for _, instance := range instances {
+		if providerOrDefault(instance.Provider) == provider {
+			matched = append(matched, instance)
+		}
+	}
+	return matched
 }
 func maskAPIKey(key string) string {
 	if len(key) <= 8 {

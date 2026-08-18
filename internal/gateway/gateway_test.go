@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,7 +20,8 @@ import (
 func testConfig(upstream string) Config {
 	c := DefaultConfig()
 	c.UpstreamURL = upstream
-	c.OpenCodeAPIKey = "zen-test-key"
+	c.UpstreamAPIKey = "tokenrouter-test-key"
+	c.ForcedModel = ""
 	c.GatewayKeys = []string{"test-key"}
 	c.MaxConcurrency = 1
 	c.QueueSize = 1
@@ -32,17 +32,30 @@ func testConfig(upstream string) Config {
 	return c
 }
 
-func TestLoadConfigRequiresOpenCodeAPIKey(t *testing.T) {
-	t.Setenv("GATEWAY_KEYS", "gateway-key")
-	t.Setenv("OPENCODE_API_KEY", "")
-	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "OPENCODE_API_KEY is required") {
-		t.Fatalf("expected missing OpenCode key error, got %v", err)
+func TestLoadConfigRequiresUpstreamAPIKey(t *testing.T) {
+	t.Setenv("UPSTREAM_API_KEY", "")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "UPSTREAM_API_KEY is required") {
+		t.Fatalf("expected missing upstream key error, got %v", err)
 	}
 }
 
-func TestForwardReplacesClientAuthorizationWithOpenCodeKey(t *testing.T) {
+func TestLoadConfigForcesProviderModelWithoutGatewayKeys(t *testing.T) {
+	t.Setenv("UPSTREAM_API_KEY", "upstream-test-key")
+	t.Setenv("UPSTREAM_PROVIDER", ProviderOpenCode)
+	t.Setenv("UPSTREAM_MODEL", "client-override-must-not-apply")
+	t.Setenv("GATEWAY_KEYS", "")
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ForcedModel != openCodeModel || c.UpstreamURL != openCodeZenURL || len(c.GatewayKeys) != 0 {
+		t.Fatalf("config = %#v", c)
+	}
+}
+
+func TestForwardReplacesClientAuthorizationWithUpstreamKey(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer zen-test-key" {
+		if got := r.Header.Get("Authorization"); got != "Bearer tokenrouter-test-key" {
 			t.Errorf("authorization = %q", got)
 		}
 		w.WriteHeader(http.StatusOK)
@@ -58,6 +71,23 @@ func TestForwardReplacesClientAuthorizationWithOpenCodeKey(t *testing.T) {
 	g.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestUpstreamTargetURLAvoidsDuplicateVersionPrefix(t *testing.T) {
+	tests := []struct {
+		baseURL string
+		path    string
+		want    string
+	}{
+		{baseURL: "https://api.tokenrouter.com/v1", path: "/v1/chat/completions", want: "https://api.tokenrouter.com/v1/chat/completions"},
+		{baseURL: "https://api.tokenrouter.com/v1/", path: "/v1/models", want: "https://api.tokenrouter.com/v1/models"},
+		{baseURL: "https://example.com", path: "/v1/models", want: "https://example.com/v1/models"},
+	}
+	for _, tt := range tests {
+		if got := upstreamTargetURL(tt.baseURL, tt.path); got != tt.want {
+			t.Errorf("upstreamTargetURL(%q, %q) = %q, want %q", tt.baseURL, tt.path, got, tt.want)
+		}
 	}
 }
 
@@ -129,7 +159,7 @@ func TestHandlerReturns405ForGetResponses(t *testing.T) {
 func TestForwardDoesNotRetrySingleEgress429(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer zen-test-key" {
+		if got := r.Header.Get("Authorization"); got != "Bearer tokenrouter-test-key" {
 			t.Errorf("authorization = %q", got)
 		}
 		calls.Add(1)
@@ -152,28 +182,16 @@ func TestForwardDoesNotRetrySingleEgress429(t *testing.T) {
 	}
 }
 
-func TestForwardRetriesOnlyDistinctEgressAndSetsOpenCodeHeaders(t *testing.T) {
+func TestForwardRetriesOnlyDistinctEgressAndPreservesModel(t *testing.T) {
 	var calls atomic.Int32
-	requestIDs := make(map[string]struct{})
-	var requestIDsMu sync.Mutex
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("User-Agent"); got != opencodeUserAgent {
-			t.Errorf("user-agent = %q", got)
+		for _, header := range []string{"X-OpenCode-Client", "X-OpenCode-Request", "X-Title"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Errorf("%s = %q", header, got)
+			}
 		}
-		if got := r.Header.Get("X-OpenCode-Client"); got != opencodeClient {
-			t.Errorf("x-opencode-client = %q", got)
-		}
-		if got := r.Header.Get("HTTP-Referer"); got != opencodeReferer {
-			t.Errorf("http-referer = %q", got)
-		}
-		if got := r.Header.Get("X-Title"); got != opencodeTitle {
-			t.Errorf("x-title = %q", got)
-		}
-		requestIDsMu.Lock()
-		requestIDs[r.Header.Get("X-OpenCode-Request")] = struct{}{}
-		requestIDsMu.Unlock()
 		body, _ := io.ReadAll(r.Body)
-		if string(body) != `{"messages":[],"model":"x-free"}` {
+		if string(body) != `{"model":"x","messages":[]}` {
 			t.Errorf("body = %q", body)
 		}
 		if calls.Add(1) < 3 {
@@ -199,24 +217,14 @@ func TestForwardRetriesOnlyDistinctEgressAndSetsOpenCodeHeaders(t *testing.T) {
 	if res.Code != http.StatusOK || calls.Load() != 3 {
 		t.Fatalf("status = %d, calls = %d, body = %s", res.Code, calls.Load(), res.Body.String())
 	}
-	if len(requestIDs) != 1 {
-		t.Fatalf("request IDs = %#v", requestIDs)
-	}
 }
 
-func TestForwardOverridesClientOpenCodeHeaders(t *testing.T) {
+func TestForwardStripsOpenCodeHeaders(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("User-Agent"); got != opencodeUserAgent {
-			t.Errorf("user-agent = %q", got)
-		}
-		if got := r.Header.Get("X-OpenCode-Client"); got != opencodeClient {
-			t.Errorf("x-opencode-client = %q", got)
-		}
-		if got := r.Header.Get("HTTP-Referer"); got != opencodeReferer {
-			t.Errorf("http-referer = %q", got)
-		}
-		if got := r.Header.Get("X-Title"); got != opencodeTitle {
-			t.Errorf("x-title = %q", got)
+		for _, header := range []string{"X-OpenCode-Client", "X-OpenCode-Request", "HTTP-Referer", "X-Title"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Errorf("%s = %q", header, got)
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -229,6 +237,9 @@ func TestForwardOverridesClientOpenCodeHeaders(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("User-Agent", "client-spoof")
 	req.Header.Set("X-OpenCode-Client", "desktop")
+	req.Header.Set("X-OpenCode-Request", "request-spoof")
+	req.Header.Set("HTTP-Referer", "https://opencode.ai/")
+	req.Header.Set("X-Title", "opencode")
 	res := httptest.NewRecorder()
 	g.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -238,6 +249,9 @@ func TestForwardOverridesClientOpenCodeHeaders(t *testing.T) {
 
 func TestNormalizeDeepSeekThinkingControls(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.UpstreamProvider = ProviderOpenCode
+	g.cfg.ForcedModel = ""
+	g.cfg.DisableThinkingByDefault = true
 	tests := []struct {
 		name                string
 		path                string
@@ -277,6 +291,7 @@ func TestNormalizeDeepSeekThinkingControls(t *testing.T) {
 
 func TestNormalizeDeepSeekThinkingCanRemainUnchanged(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.ForcedModel = ""
 	g.cfg.DisableThinkingByDefault = false
 	body := `{"model":"deepseek-v4-flash-free","messages":[]}`
 	if got := string(g.normalizeRequestBody("/v1/chat/completions", []byte(body))); got != body {
@@ -284,8 +299,9 @@ func TestNormalizeDeepSeekThinkingCanRemainUnchanged(t *testing.T) {
 	}
 }
 
-func TestNormalizeResponsesConvertsNativeInputToMessages(t *testing.T) {
+func TestNormalizeResponsesPassesNativeInputThrough(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.ForcedModel = ""
 	g.cfg.FreeModelsOnly = false
 	g.cfg.DisableThinkingByDefault = false
 	g.cfg.MinThinkingMaxTokens = 0
@@ -298,55 +314,28 @@ func TestNormalizeResponsesConvertsNativeInputToMessages(t *testing.T) {
 			{"type":"input_text","text":"standalone content"}
 		]
 	}`))
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := payload["input"]; exists {
-		t.Fatalf("native input was forwarded unchanged: %#v", payload)
-	}
-	if _, exists := payload["instructions"]; exists {
-		t.Fatalf("instructions were not folded into messages: %#v", payload)
-	}
-	messages := payload["messages"].([]any)
-	if len(messages) != 4 {
-		t.Fatalf("messages = %#v", messages)
-	}
-	first := messages[0].(map[string]any)
-	if first["role"] != "system" || first["content"] != "Gateway instructions" || first["id"] != "msg_gateway_messages_0" {
-		t.Fatalf("instructions message = %#v", first)
-	}
-	user := messages[2].(map[string]any)
-	if user["role"] != "user" || user["content"] != "Hello" || user["id"] != "msg_from_client" {
-		t.Fatalf("user message = %#v", user)
-	}
-	standalone := messages[3].(map[string]any)
-	if standalone["content"] != "standalone content" || standalone["id"] != "msg_gateway_messages_3" {
-		t.Fatalf("standalone input message = %#v", standalone)
+	if string(body) == "" || !strings.Contains(string(body), `"input"`) || !strings.Contains(string(body), `"instructions"`) {
+		t.Fatalf("native Responses input was changed: %s", body)
 	}
 }
 
-func TestNormalizeResponsesAddsIDsToLegacyMessages(t *testing.T) {
+func TestNormalizeResponsesPassesLegacyMessagesThrough(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.ForcedModel = ""
 	g.cfg.FreeModelsOnly = false
 	g.cfg.DisableThinkingByDefault = false
 	g.cfg.MinThinkingMaxTokens = 0
 	body := g.normalizeRequestBody("/v1/responses", []byte(`{"model":"model-a","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi","id":"msg_client"}]}`))
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatal(err)
-	}
-	messages := payload["messages"].([]any)
-	if got := messages[0].(map[string]any)["id"]; got != "msg_gateway_messages_0" {
-		t.Fatalf("generated id = %#v", got)
-	}
-	if got := messages[1].(map[string]any)["id"]; got != "msg_client" {
-		t.Fatalf("existing id = %#v", got)
+	if got := string(body); got != `{"model":"model-a","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi","id":"msg_client"}]}` {
+		t.Fatalf("legacy messages were changed: %s", got)
 	}
 }
 
 func TestNormalizeDeepSeekThinkingRaisesLowTokenBudgets(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.UpstreamProvider = ProviderOpenCode
+	g.cfg.ForcedModel = ""
+	g.cfg.MinThinkingMaxTokens = 8192
 	tests := []struct {
 		name      string
 		path      string
@@ -377,45 +366,11 @@ func TestNormalizeDeepSeekThinkingRaisesLowTokenBudgets(t *testing.T) {
 
 func TestNormalizeDeepSeekThinkingBudgetGuardCanBeDisabled(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.ForcedModel = ""
 	g.cfg.MinThinkingMaxTokens = 0
 	body := `{"model":"deepseek-v4-flash-free","thinking":{"type":"enabled"},"max_tokens":1024}`
 	if got := string(g.normalizeRequestBody("/v1/chat/completions", []byte(body))); got != body {
 		t.Fatalf("body = %s, want unchanged %s", got, body)
-	}
-}
-
-func TestForwardUsesConfiguredZenCPAHeaders(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("User-Agent"); got != "opencode/1.4.3" {
-			t.Errorf("user-agent = %q", got)
-		}
-		if got := r.Header.Get("X-OpenCode-Client"); got != "desktop" {
-			t.Errorf("x-opencode-client = %q", got)
-		}
-		if got := r.Header.Get("HTTP-Referer"); got != "https://opencode.ai/" {
-			t.Errorf("http-referer = %q", got)
-		}
-		if got := r.Header.Get("X-Title"); got != "opencode" {
-			t.Errorf("x-title = %q", got)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-	c := testConfig(upstream.URL)
-	c.OpenCodeClient = "desktop"
-	c.OpenCodeVersion = "1.4.3"
-	c.OpenCodeReferer = "https://opencode.ai/"
-	c.OpenCodeTitle = "opencode"
-	g, err := New(c, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer test-key")
-	res := httptest.NewRecorder()
-	g.Handler().ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}
 }
 
@@ -427,7 +382,9 @@ func TestForwardAddsContextToUpstreamResponseEOF(t *testing.T) {
 			Body:       io.NopCloser(&errorReader{err: io.ErrUnexpectedEOF}),
 		}, nil
 	})}
-	g, err := New(testConfig("https://example.com"), slog.Default())
+	c := testConfig("https://example.com")
+	c.MaxRetries = 0
+	g, err := New(c, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +545,7 @@ func TestModelCooldownDoesNotBlockOtherModelsOnSameEgress(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		body, _ := io.ReadAll(r.Body)
-		if strings.Contains(string(body), `"model":"model-a-free"`) {
+		if strings.Contains(string(body), `"model":"model-a"`) {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
@@ -654,7 +611,7 @@ func TestModel429FailsOverOnceToDistinctEgress(t *testing.T) {
 	if len(g.audits) != 2 || g.audits[0].Status != http.StatusTooManyRequests || g.audits[1].Status != http.StatusOK {
 		t.Fatalf("audits = %#v", g.audits)
 	}
-	if g.audits[0].Model != "model-a-free" || g.audits[1].Model != "model-a-free" {
+	if g.audits[0].Model != "model-a" || g.audits[1].Model != "model-a" {
 		t.Fatalf("audit models = %q, %q", g.audits[0].Model, g.audits[1].Model)
 	}
 }
@@ -1276,11 +1233,13 @@ func TestCopyStreamResponseRejectsResponsesEOFWithoutCompleted(t *testing.T) {
 	}
 }
 
-func TestNormalizeResponsesRejectsUnsupportedContentPart(t *testing.T) {
+func TestNormalizeResponsesPassesUnsupportedContentPartThrough(t *testing.T) {
 	g := &Gateway{cfg: DefaultConfig()}
-	_, err := g.normalizeRequestBodyChecked("/v1/responses", []byte(`{"model":"model-a","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}]}`))
-	if !errors.Is(err, errUnsupportedResponsesInput) {
-		t.Fatalf("err=%v", err)
+	g.cfg.ForcedModel = ""
+	body := `{"model":"model-a","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}]}`
+	got, err := g.normalizeRequestBodyChecked("/v1/responses", []byte(body))
+	if err != nil || string(got) != body {
+		t.Fatalf("body=%s err=%v", got, err)
 	}
 }
 
